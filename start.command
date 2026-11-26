@@ -13,8 +13,8 @@ if [[ "${1:-}" == --setup ]]; then
   setup=true
   shift
 fi
-[[ $# -eq 0 ]] || fail "请运行 start.command，首次使用请运行 setup.command。"
-[[ -f package.json && -f package-lock.json && -d drizzle ]] || fail "请完整解压项目，并从 studio 目录运行脚本。"
+[[ $# -eq 0 ]] || fail "请运行 start.command，首次使用请运行 sh setup.sh。"
+[[ -f package.json && -f package-lock.json && -d drizzle ]] || fail "请完整解压项目，并在 package.json 所在目录运行脚本。"
 
 platform="$(uname -s)"
 case "$platform" in
@@ -106,7 +106,7 @@ install_linux_node() (
 install_mac_tools() {
   if ! find_brew; then install_homebrew; fi
   load_tools
-  find_brew || fail "没有找到 Homebrew。完成安装器提示后，请重新运行 setup.command。"
+  find_brew || fail "没有找到 Homebrew。完成安装器提示后，请重新运行 sh setup.sh。"
   if ! node_ready; then "$brew_bin" install node@24; fi
   if ! media_ready; then "$brew_bin" install ffmpeg-full; fi
 }
@@ -137,8 +137,8 @@ if $setup && { ! node_ready || ! media_ready; }; then
   if [[ "$platform" == Darwin ]]; then install_mac_tools; else install_linux_tools; fi
   load_tools
 fi
-node_ready || fail "需要 Node.js 24.9 及以上版本和 npm，请先运行 setup.command。"
-media_ready || fail "需要 ffprobe 和支持字幕、H.264、AAC 的 FFmpeg。请运行 setup.command，或检查 FFMPEG_PATH 和 FFPROBE_PATH。"
+node_ready || fail "需要 Node.js 24.9 及以上版本和 npm，请先运行 sh setup.sh。"
+media_ready || fail "需要 ffprobe 和支持字幕、H.264、AAC 的 FFmpeg。请运行 sh setup.sh，或检查 FFMPEG_PATH 和 FFPROBE_PATH。"
 
 # Check before building or opening the database, so an existing service can keep running.
 port="${DOMAN_PORT:-5179}"
@@ -165,7 +165,7 @@ if $setup; then
   npm run build
 fi
 [[ -d node_modules/esbuild && -f dist/server/index.mjs && -f dist/client/index.html ]] ||
-  fail "项目还未初始化，请先运行 setup.command。"
+  fail "项目还未初始化，请先运行 sh setup.sh。"
 
 printf '正在启动 do漫，服务就绪后请打开 http://127.0.0.1:%s。\n' "$port"
 exec npm start -- --hostname 127.0.0.1 --port "$port"
