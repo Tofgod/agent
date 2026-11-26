@@ -1,0 +1,1 @@
+ALTER TABLE `agent_inputs` ADD `source` text;

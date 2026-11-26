@@ -1,0 +1,1 @@
+ALTER TABLE `background_job_output` ADD `fragment` integer DEFAULT 0 NOT NULL;

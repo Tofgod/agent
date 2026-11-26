@@ -1,0 +1,86 @@
+# Dependencies
+node_modules/
+/.pnp
+.pnp.*
+# Keep authored Yarn tooling if the project adopts Yarn.
+/.yarn/*
+!/.yarn/patches/
+!/.yarn/plugins/
+!/.yarn/releases/
+!/.yarn/versions/
+
+# Generated builds and framework state
+/dist/
+/.next/
+/.vinext/
+/.vite/
+/.cache/
+/.npm/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Test output
+/coverage/
+
+# Package-manager logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+*.log
+*.log.*
+/logs/
+*.pid
+*.sock
+
+# Local environment and keys
+.env*
+.dev.vars*
+*.pem
+*.key
+*.p12
+*.pfx
+/.aws/
+/.ssh/
+
+# Checkout-local tool state
+/.wrangler/
+/.sites-runtime/
+/.openai/
+/.studio-runtime/
+
+# Workspace scaffolding and publication archives
+/.agents/
+/.codex/
+/outputs/
+/work/
+/tmp/
+/backups/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Local architecture review and Harness reference materials
+/REFERENCE_REVIEW.md
+/docs/reference/
+/docs/DO_MAN_REBUILD_PLAN.zh-CN.md
+
+# OS metadata
+.DS_Store
+Thumbs.db
+/.idea/
+/.vscode/
+
+# Local application databases, projects and media
+/data/
+/workspaces/
+/uploads/
+/media/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*

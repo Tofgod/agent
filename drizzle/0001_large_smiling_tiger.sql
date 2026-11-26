@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `lease_token` text DEFAULT '' NOT NULL;

@@ -1,0 +1,2 @@
+CREATE UNIQUE INDEX `projects_one_example_per_user` ON `projects` (`user_id`) WHERE is_example = 1;--> statement-breakpoint
+CREATE UNIQUE INDEX `runs_one_active_per_project` ON `runs` (`project_id`) WHERE status IN ('queued','running','waiting');

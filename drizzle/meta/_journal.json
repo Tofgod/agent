@@ -1,0 +1,307 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1794816523324,
+      "tag": "0000_quick_mentor",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1794817376754,
+      "tag": "0001_large_smiling_tiger",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794820869976,
+      "tag": "0002_dusty_microbe",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1794880262878,
+      "tag": "0003_amused_iceman",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794886940742,
+      "tag": "0004_optimal_surge",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794888002493,
+      "tag": "0005_bored_switch",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794891666781,
+      "tag": "0006_previous_kronos",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794900910899,
+      "tag": "0007_execution_steps",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1794970574050,
+      "tag": "0008_message_submission",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1794971569544,
+      "tag": "0009_turn_file_versions",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1794972706230,
+      "tag": "0010_workspace_feed",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1794981525489,
+      "tag": "0011_durable_chat_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1794982681598,
+      "tag": "0012_current_turn_input",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1794983500000,
+      "tag": "0013_session_and_background_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1794983600000,
+      "tag": "0014_release_abandoned_leases",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1795059679016,
+      "tag": "0015_studio_sessions_deliveries",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1795065535365,
+      "tag": "0016_conversation_fork_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1795066883414,
+      "tag": "0017_agent_inbox_source",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1795067631054,
+      "tag": "0018_agent_execution_semantics",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1795068039768,
+      "tag": "0019_durable_agent_inbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1795069292113,
+      "tag": "0020_agent_settlement_order",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1795070298462,
+      "tag": "0021_record_skipped_tool_calls",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1795071356513,
+      "tag": "0022_model_attempt_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1795074311159,
+      "tag": "0023_closed_turn_revision",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1795075308329,
+      "tag": "0024_deferred_tool_contexts",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1795079247142,
+      "tag": "0025_team_mode_and_task_scopes",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1795080302086,
+      "tag": "0026_provider_files_cache",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1795081038564,
+      "tag": "0027_model_request_parts",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1795082025464,
+      "tag": "0028_session_reference_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1795138963906,
+      "tag": "0029_session_collaboration_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1795168227626,
+      "tag": "0030_workspace_jobs",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1795417685680,
+      "tag": "0031_background_job_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1795420495195,
+      "tag": "0032_studio_extensions",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1795422827729,
+      "tag": "0033_schedule_history_presets",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "6",
+      "when": 1795422953036,
+      "tag": "0034_fork_event_ancestry",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "6",
+      "when": 1795426431806,
+      "tag": "0035_mcp_credential_vault",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1795507200000,
+      "tag": "0036_schedule_delivery_fork_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1795500613490,
+      "tag": "0037_background_output_channels",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1795500899937,
+      "tag": "0038_inspector_output_timing",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "6",
+      "when": 1795503606685,
+      "tag": "0039_background_output_fragments",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "6",
+      "when": 1795507712391,
+      "tag": "0040_schedule_idle_slots",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "6",
+      "when": 1795509037809,
+      "tag": "0041_schedule_idle_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "6",
+      "when": 1795509037810,
+      "tag": "0042_session_management",
+      "breakpoints": true
+    }
+  ]
+}

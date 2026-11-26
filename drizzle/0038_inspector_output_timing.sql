@@ -1,0 +1,1 @@
+ALTER TABLE `model_calls` ADD `last_output_at` text;

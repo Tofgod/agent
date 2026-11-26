@@ -1,0 +1,1 @@
+ALTER TABLE `tool_receipts` ADD `additional_contexts` text;
