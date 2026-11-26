@@ -7,6 +7,7 @@ import { createModel } from "@/lib/studio/providers";
 import { controlRun } from "@/lib/studio/control";
 import { settingsInput, mergeSettings } from "@/lib/studio/settings";
 import { clearLocalModelKeys } from "@/server/model-keys";
+import { cleanDeletedProject } from "@/server/project-deletion";
 import { uid } from "@/lib/studio/store";
 import { textZip } from "@/lib/studio/zip";
 import { PROJECT_FOLDERS, PROJECT_TRASH, referencePath } from "@/lib/studio/project-layout";
@@ -117,7 +118,17 @@ async function handle(request: Request, context: Context): Promise<Response> {
       return Response.json(created, { status: 201 });
     }
   }
+  if (p.length === 2 && method === "DELETE") {
+    const id = z.string().uuid().parse(p[1]);
+    await store.deleteArchivedProject(id, userId);
+    try { await cleanDeletedProject(store, id, bucket, disk); }
+    catch { throw new AppError("项目记录已删除，本地文件清理失败，请重试", 500, "PROJECT_CLEANUP_FAILED"); }
+    return Response.json({ ok: true });
+  }
   const project = await store.project(p[1], userId);
+  const assertProjectWritable = async () => {
+    if ((await store.project(project.id, userId)).status === "archived") throw new AppError("请先恢复项目再继续工作", 409, "PROJECT_ARCHIVED");
+  };
   const params = new URL(request.url).searchParams;
   const sessionId = params.get("session") ?? "";
   store.assertSession(project.id, sessionId);
@@ -164,6 +175,7 @@ async function handle(request: Request, context: Context): Promise<Response> {
           throw new AppError("技能包最多包含 64 个文件及 16 MiB 内容", 413);
         files.set(relative, new Uint8Array(await file.arrayBuffer()));
       }
+      await assertProjectWritable();
       return Response.json(library.importBundle(project.id, scope, files));
     }
     const scope = z.enum(["project", "global", "external"]).parse(p[3]);
@@ -172,6 +184,7 @@ async function handle(request: Request, context: Context): Promise<Response> {
     if (scope === "external") throw new AppError("请在本机目录中编辑该技能", 403);
     if (method === "POST" && !name || method === "PUT" && name) {
       const { text } = z.strictObject({ text: z.string() }).parse(await bodyJson(request));
+      await assertProjectWritable();
       return Response.json(library.save(project.id, scope, text, name));
     }
     if (method === "DELETE" && name) { library.remove(project.id, scope, name); return Response.json({ ok: true }); }
@@ -365,11 +378,18 @@ async function handle(request: Request, context: Context): Promise<Response> {
     const kind = type.startsWith("image/") ? "image" : type.startsWith("video/") ? "video" : "audio";
     const path = referencePath(file.name, type);
     const objectKey = project.id + "/uploads/" + uid();
-    await bucket.put(objectKey, await file.arrayBuffer(), { httpMetadata: { contentType: type } });
-    return Response.json(await store.putArtifact(project.id, {
-      path, kind, content: "", serveMedia: true,
-      metadata: { objectKey, contentType: type, reference: type.startsWith("image/"), uploaded: true },
-    }));
+    const bytes = await file.arrayBuffer();
+    await assertProjectWritable();
+    await bucket.put(objectKey, bytes, { httpMetadata: { contentType: type } });
+    try {
+      return Response.json(await store.putArtifact(project.id, {
+        path, kind, content: "", serveMedia: true,
+        metadata: { objectKey, contentType: type, reference: type.startsWith("image/"), uploaded: true },
+      }));
+    } catch (error) {
+      await bucket.remove?.(objectKey).catch(() => {});
+      throw error;
+    }
   }
   if (p[2] === "chat" && method === "POST") {
     const parsed = z.object({

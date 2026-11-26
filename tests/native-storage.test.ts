@@ -1,7 +1,7 @@
 import { ProjectDisk } from "../server/project-disk";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SQLiteDatabase, LocalMediaStore } from "../server/storage";
@@ -12,6 +12,10 @@ import { DEFAULT_SETTINGS } from "../lib/studio/types";
 import { executeFileTool } from "../lib/studio/file-tools";
 import { configureRuntime } from "../server/runtime";
 import { DELETE, GET } from "../app/api/studio/[...path]/route";
+import { SkillLibrary } from "../lib/studio/skills";
+import { Schedules } from "../lib/studio/schedules";
+import { recordModelRequest } from "../lib/studio/model-request-record";
+import { cleanDeletedProject } from "../server/project-deletion";
 
 test("native SQLite preserves project data and encrypted settings across restart", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "mujian-db-"));
@@ -24,6 +28,97 @@ test("native SQLite preserves project data and encrypted settings across restart
     assert.equal((await restored.artifacts(project.id))[0].content, "用户保留的原稿");
     assert.equal((await restored.getSettings("local", "private-local-encryption-key-32chars")).textApiKey, "native-private-key"); reopened.close();
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("only an owned archive can be permanently deleted, including its local files and execution history", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "doman-delete-project-"));
+  const db = new SQLiteDatabase(path.join(root, "studio.sqlite"));
+  db.initialize("drizzle");
+  const skills = new SkillLibrary(path.join(root, "skills"));
+  const store = new Store(db, { skills }), mediaRoot = path.join(root, "media"), media = new LocalMediaStore(mediaRoot, db);
+  const disk = new ProjectDisk(path.join(root, "workspaces"), store, media, "local");
+  const remove = (id: string, userId = "local") => {
+    configureRuntime({ database: db, media, disk, skills, userId, workerSecret: "test", encryptionSecret: "test" });
+    return DELETE(new Request("http://localhost/api/studio/projects/" + id, { method: "DELETE" }), { params: Promise.resolve({ path: ["projects", id] }) });
+  };
+  try {
+    const project = await store.createProject("local", { title: "Archived production" });
+    const other = await store.createProject("local", { title: "Keep this project" });
+    const file = await store.createProjectDocument(project.id, "/01_创作/剧本.md", "第一版");
+    const workspace = await disk.activate(project.id);
+    const content = "---\nname: storyboard\ndescription: Storyboard guide\n---\nStory notes";
+    skills.save(project.id, "project", content);
+    skills.save(other.id, "project", content);
+    skills.save(project.id, "global", content);
+    const session = await store.createSession(project.id, "分镜对话");
+    await store.addMessage(project.id, "user", "需要删除的对话");
+    const schedules = new Schedules(store);
+    await schedules.save(project.id, { title: "Review", prompt: "Review notes", timing: { kind: "after", after_seconds: 60 },
+      target: { kind: "session", id: session.id } });
+    await media.put(project.id + "/uploads/old-version", "bytes");
+    await media.put(other.id + "/uploads/keep", "bytes");
+
+    const modelRequest = (name: string) => ({ system: "Shared system instructions", messages: [
+      { role: "user", content: "A common message shared by both projects, long enough to be stored separately." },
+      { role: "user", content: "A project-specific private message stored separately for " + name },
+    ] });
+    const record = async (projectId: string, name: string) => {
+      const run = await store.createRun(projectId, { instruction: "Read scene", sourceVersions: {} });
+      assert.ok(await store.claimRun(run.id, projectId));
+      const request = modelRequest(name), requestId = crypto.randomUUID();
+      await store.beginModelCall(await store.run(run.id, projectId), requestId, request);
+      await store.db.prepare("UPDATE runs SET status='done',lease_until=0 WHERE id=?").bind(run.id).run();
+      return { run, requestId, parts: recordModelRequest(request).parts };
+    };
+    const discarded = await record(project.id, "deletion"), preserved = await record(other.id, "retention");
+    await db.prepare("INSERT INTO background_job_output(job_id,line,created_at) VALUES(?,?,?)")
+      .bind(discarded.run.id, "生成日志", new Date().toISOString()).run();
+    assert.equal((await remove(project.id)).status, 409);
+    assert.equal(await readFile(path.join(workspace, "01_创作", "剧本.md"), "utf8"), "第一版");
+    await store.archiveProject(project.id, "local", true, true);
+    assert.equal((await remove(project.id, "another-user")).status, 404);
+    await db.prepare("UPDATE runs SET lease_until=? WHERE id=?").bind(Date.now() + 60000, discarded.run.id).run();
+    assert.equal((await remove(project.id)).status, 409);
+    await db.prepare("UPDATE runs SET lease_until=0 WHERE id=?").bind(discarded.run.id).run();
+    const deleted = await remove(project.id);
+    assert.equal(deleted.status, 200, await deleted.text());
+    assert.deepEqual((await store.listProjects("local")).map(({ id }) => id), [other.id]);
+    const records = (table: string, column: string, id: string) => db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column}=?`).bind(id).rows<{ count: number }>().at(0)?.count;
+    for (const table of ["messages", "runs", "events", "agent_inbox", "project_sessions", "studio_schedules", "artifacts", "disk_workspaces", "project_deletions"])
+      assert.equal(records(table, "project_id", project.id), 0, table);
+    assert.equal(records("artifact_versions", "artifact_id", file.id), 0);
+    assert.equal(records("model_calls", "id", discarded.requestId), 0);
+    assert.equal(records("background_job_output", "job_id", discarded.run.id), 0);
+    assert.equal(records("model_calls", "id", preserved.requestId), 1);
+    for (const id of discarded.parts.keys()) assert.equal(records("model_request_parts", "id", id), Number(preserved.parts.has(id)));
+    assert.deepEqual(db.connection.prepare("PRAGMA foreign_key_check").all(), []);
+    await assert.rejects(stat(workspace), { code: "ENOENT" });
+    await assert.rejects(stat(path.join(mediaRoot, project.id)), { code: "ENOENT" });
+    await assert.rejects(stat(path.join(root, "skills", "projects", project.id)), { code: "ENOENT" });
+    assert.equal(await media.get(project.id + "/uploads/old-version"), null);
+    assert.ok(await media.get(other.id + "/uploads/keep"));
+    assert.equal(skills.source(other.id, "project", "storyboard"), content);
+    assert.equal(skills.source(other.id, "global", "storyboard"), content);
+
+    const interrupted = await store.createProject("local", {});
+    await media.put(interrupted.id + "/uploads/old", "bytes");
+    await store.archiveProject(interrupted.id, "local", true);
+    const hidden = mediaRoot + "-temporarily-unavailable";
+    await rename(mediaRoot, hidden);
+    const failed = await remove(interrupted.id);
+    assert.equal(failed.status, 500);
+    assert.equal((await failed.json()).code, "PROJECT_CLEANUP_FAILED");
+    assert.equal(records("project_deletions", "project_id", interrupted.id), 1);
+    assert.equal((await remove(interrupted.id, "another-user")).status, 404);
+    await rename(hidden, mediaRoot);
+    const reopened = new SQLiteDatabase(path.join(root, "studio.sqlite"));
+    try { await cleanDeletedProject(new Store(reopened), interrupted.id, new LocalMediaStore(mediaRoot, reopened)); }
+    finally { reopened.close(); }
+    assert.equal(records("project_deletions", "project_id", interrupted.id), 0);
+    await assert.rejects(stat(path.join(mediaRoot, interrupted.id)), { code: "ENOENT" });
+  } finally {
+    skills.close(); await disk.close(); db.close(); await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("clearing model keys scrubs SQLite pages and WAL in both the current and legacy workspace", async () => {

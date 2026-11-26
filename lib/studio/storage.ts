@@ -21,4 +21,5 @@ export interface BlobStore {
   get(key: string, options?: { range: Headers }): Promise<MediaObject | null>;
   put(key: string, value: ArrayBuffer | ArrayBufferView | ReadableStream<Uint8Array> | string, options?: { httpMetadata?: { contentType?: string } }): Promise<void>;
   remove?(key: string): Promise<void>;
+  removeProject?(projectId: string): Promise<void>;
 }

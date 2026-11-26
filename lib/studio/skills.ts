@@ -428,6 +428,14 @@ export class SkillLibrary {
     renameSync(target, path.join(trash, randomUUID() + "-" + path.basename(target)));
     this.changed(root);
   }
+  removeProject(projectId: string) {
+    const root = this.directory(projectId, "project"), parent = path.dirname(root);
+    const info = lstatSync(parent, { throwIfNoEntry: false });
+    if (!info) return;
+    if (!info.isDirectory()) throw new AppError("项目技能目录无效");
+    rmSync(root, { recursive: true, force: true });
+    this.changed(root);
+  }
   load(projectId: string, name: string, allowed: readonly string[] | null | undefined, mode: "model" | "user", resource?: string) {
     const entry = this.resolve(projectId, name);
     if ((allowed != null && !allowed.includes(name)) || !(mode === "model" ? entry.modelInvocable : entry.userInvocable))

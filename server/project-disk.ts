@@ -76,6 +76,18 @@ export class ProjectDisk {
     else await exec(process.platform === "darwin" ? "/usr/bin/open" : "xdg-open", [location]);
   }
 
+  async removeProject(projectId: string) {
+    clearTimeout(this.timers.get(projectId));
+    this.timers.delete(projectId);
+    await this.pending.get(projectId)?.catch(this.report);
+    this.watchers.get(projectId)?.close();
+    this.watchers.delete(projectId);
+    const parent = await lstat(this.root).catch((error) => { if (!missing(error)) throw error; });
+    if (!parent) return;
+    if (!parent.isDirectory()) throw new AppError("工作目录包含链接或非目录项目", 409, "WORKSPACE_PATH");
+    await rm(path.join(this.root, projectId), { recursive: true, force: true });
+  }
+
   private schedule(projectId: string) {
     if (this.closed || this.timers.has(projectId)) return;
     this.timers.set(projectId, setTimeout(() => {

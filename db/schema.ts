@@ -9,6 +9,9 @@ export const projects = sqliteTable("projects", {
   mainSessionTitle: text("main_session_title").notNull().default("主对话"),
 }, (t) => [index("projects_user_idx").on(t.userId),
   uniqueIndex("projects_one_example_per_user").on(t.userId).where(sql.raw("is_example = 1"))]);
+export const projectDeletions = sqliteTable("project_deletions", {
+  projectId: text("project_id").primaryKey().notNull(), userId: text("user_id").notNull(),
+});
 export const chatQueue = sqliteTable("chat_queue", {
   projectId: text("project_id").notNull().references(() => projects.id),
   sessionId: text("session_id").notNull().default(""),

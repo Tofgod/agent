@@ -10,6 +10,7 @@ import * as studio from "../app/api/studio/[...path]/route";
 import * as worker from "../app/api/worker/[...path]/route";
 import { errorResponse } from "../lib/studio/server";
 import { ProjectDisk } from "./project-disk";
+import { cleanDeletedProject } from "./project-deletion";
 import { Store } from "../lib/studio/store";
 import { AppError } from "../lib/studio/security";
 import { STUDIO_NAME } from "../lib/studio/types";
@@ -61,6 +62,11 @@ await recovery.recoverStoppedExecutions();
 await recovery.resumeInterruptedAgentRuns();
 const media = new LocalMediaStore(path.join(dataDir, "media"), database);
 const disk = new ProjectDisk(path.join(dataDir, "workspaces"), recovery, media, "local");
+for (const { project_id } of database.prepare("SELECT project_id FROM project_deletions").rows<{ project_id: string }>()) {
+  await cleanDeletedProject(recovery, project_id, media, disk).catch((error) => {
+    console.error("[清理已删除项目]", project_id, error instanceof Error ? error.name : String(error));
+  });
+}
 disk.start();
 configureRuntime({ database, media, disk, userId: "local", workerSecret, encryptionSecret: env.SETTINGS_ENCRYPTION_KEY!,
   ...runtimeOptions });

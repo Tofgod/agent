@@ -327,6 +327,17 @@ export class Store {
     }
     return this.project(projectId, userId);
   }
+  async deleteArchivedProject(projectId: string, userId: string) {
+    const removed = await this.db.prepare(`DELETE FROM projects WHERE id=? AND user_id=? AND status='archived'
+      AND NOT EXISTS(SELECT 1 FROM runs WHERE project_id=projects.id AND (status IN ('queued','running','waiting') OR lease_until>?))
+      AND NOT EXISTS(SELECT 1 FROM chat_queue WHERE project_id=projects.id AND status='pending')`)
+      .bind(projectId, userId, Date.now()).run();
+    if (removed.meta.changes || this.db.prepare("SELECT 1 FROM project_deletions WHERE project_id=? AND user_id=?").bind(projectId, userId).rows().length) return;
+    const [project] = this.db.prepare("SELECT status FROM projects WHERE id=? AND user_id=?").bind(projectId, userId).rows<{ status: string }>();
+    if (!project) throw new AppError("项目不存在", 404, "PROJECT_NOT_FOUND");
+    if (project.status !== "archived") throw new AppError("请先归档项目", 409, "PROJECT_NOT_ARCHIVED");
+    throw new AppError("项目仍有运行中的任务或待发消息，请稍后重试", 409, "PROJECT_BUSY");
+  }
   async renameSession(projectId: string, sessionId: string, title: string) {
     const update = sessionId
       ? this.db.prepare("UPDATE project_sessions SET title=? WHERE project_id=? AND id=?").bind(title, projectId, sessionId)

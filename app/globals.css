@@ -35,6 +35,9 @@ textarea { resize:vertical; }
 .project-item { display:flex; align-items:center; gap:6px; width:100%; min-height:38px; padding:8px 10px; border-radius:7px; font-size:14px; text-align:left; margin-bottom:3px; }
 .project-item>span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .project-item small { font-size:11px; color:#7a7a7a; margin-left:auto; white-space:nowrap; }
+.project-group:has(.project-delete) { display:flex; align-items:center; gap:4px; margin-bottom:3px; }
+.project-group:has(.project-delete) .project-item { flex:1; min-width:0; margin-bottom:0; }
+.project-delete { width:30px; height:30px; }
 .project-item:is(:hover,:focus-visible),.folder-row:is(:hover,:focus-visible),.file-row:is(:hover,:focus-visible) { background:var(--hover); }
 .project-item:focus-visible,.folder-row:focus-visible,.file-row:focus-visible { outline-offset:-2px; }
 .project-search { width:100%; border:1px solid #ddd; border-radius:7px; background:#fff; padding:8px 10px; font-size:13px; margin:-10px 0 18px; outline:none; }
@@ -219,6 +222,8 @@ dd { margin:0; color:#5f5f5f; }
 .conversation-rename-actions { display:flex; justify-content:flex-end; gap:8px; }
 .conversation-rename-actions .button { min-width:62px; }
 .conversation-rename-error { color:#595959; font-size:13px; margin:0; }
+.project-delete-confirm { display:grid; gap:14px; padding:8px 22px 20px; font-size:13px; line-height:1.65; overflow-wrap:anywhere; }
+.project-delete-confirm p { margin:0; }
 .form-fields { padding:22px 24px; display:flex; flex-direction:column; gap:17px; }
 .form-fields label { display:flex; flex-direction:column; gap:8px; font-size:12px; color:#626262; }
 .form-fields input,.form-fields textarea { width:100%; border:1px solid #dcdcdc; background:#fff; border-radius:7px; padding:9px 10px; outline:none; font-size:13px; line-height:1.5; color:#222; }

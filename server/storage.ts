@@ -1,6 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { mkdirSync, readFileSync, readdirSync, createReadStream } from "node:fs";
-import { mkdir, open, readFile, link, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, link, rm } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import path from "node:path";
@@ -79,6 +79,7 @@ export class SQLiteDatabase implements Database {
   close() { this.connection.close(); }
 }
 export class LocalMediaStore implements BlobStore {
+  private readonly writes = new Map<string, Set<Promise<void>>>();
   constructor(private root: string, private database: SQLiteDatabase) {
     mkdirSync(root, { recursive: true });
     database.connection.exec("CREATE TABLE IF NOT EXISTS _studio_media(key TEXT PRIMARY KEY, content_type TEXT NOT NULL,size INTEGER NOT NULL,etag TEXT NOT NULL)");
@@ -93,7 +94,22 @@ export class LocalMediaStore implements BlobStore {
     await rm(this.filename(key), { force: true });
     this.database.connection.prepare("DELETE FROM _studio_media WHERE key=?").run(key);
   }
+  async removeProject(projectId: string) {
+    await Promise.allSettled(this.writes.get(projectId) ?? []);
+    if (!(await lstat(this.root)).isDirectory()) throw new AppError("素材目录无效");
+    await rm(this.filename(projectId), { recursive: true, force: true });
+    this.database.connection.prepare("DELETE FROM _studio_media WHERE key GLOB ?").run(projectId + "/*");
+  }
   async put(key: string, value: ArrayBuffer | ArrayBufferView | ReadableStream<Uint8Array> | string, options?: { httpMetadata?: { contentType?: string } }) {
+    const projectId = key.split("/", 1)[0];
+    const writes = this.writes.get(projectId) ?? new Set<Promise<void>>();
+    this.writes.set(projectId, writes);
+    const write = this.write(key, value, options?.httpMetadata?.contentType);
+    writes.add(write);
+    try { await write; }
+    finally { writes.delete(write); if (!writes.size) this.writes.delete(projectId); }
+  }
+  private async write(key: string, value: ArrayBuffer | ArrayBufferView | ReadableStream<Uint8Array> | string, contentType?: string) {
     const filename = this.filename(key), temp = filename + "." + randomUUID() + ".tmp";
     await mkdir(path.dirname(filename), { recursive: true });
     const file = await open(temp, "wx", 0o600), hash = createHash("sha256"); let size = 0;
@@ -118,7 +134,7 @@ export class LocalMediaStore implements BlobStore {
         if ('"' + digest.digest("hex") + '"' !== etag) throw new AppError("此素材版本已存在，请保存为新版本", 409, "OBJECT_CONFLICT");
       }
       this.database.connection.prepare("INSERT INTO _studio_media VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET content_type=excluded.content_type,size=excluded.size,etag=excluded.etag")
-        .run(key, options?.httpMetadata?.contentType || "application/octet-stream", size, etag);
+        .run(key, contentType || "application/octet-stream", size, etag);
       await rm(temp, { force: true });
     } catch (error) { await file.close().catch(() => {}); await rm(temp, { force: true }); throw error; }
   }

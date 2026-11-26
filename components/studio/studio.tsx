@@ -1,6 +1,6 @@
 "use client";
 import { type CSSProperties, type DragEvent, type KeyboardEvent, type ReactNode, Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Activity, ArrowDown, ArrowUp, Blocks, Check, ChevronDown, ChevronRight, Clapperboard, Command, Download, FileText, Film, Folder, FolderOpen, GitBranch, Image as ImageIcon, Link2, ListOrdered, LoaderCircle, Music2, PanelLeftClose, PanelLeftOpen, PanelRight, Paperclip, Pencil, Pin, Plus, RotateCcw, Search, Settings2, Square, Users, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, Blocks, Check, ChevronDown, ChevronRight, Clapperboard, Command, Download, FileText, Film, Folder, FolderOpen, GitBranch, Image as ImageIcon, Link2, ListOrdered, LoaderCircle, Music2, PanelLeftClose, PanelLeftOpen, PanelRight, Paperclip, Pencil, Pin, Plus, RotateCcw, Search, Settings2, Square, Trash2, Users, X } from "lucide-react";
 import { CHAT_ATTACHMENT_LIMIT, STUDIO_NAME, type Artifact, type ChatSubmission, type ExecutionStep, type HistoryMatch, type HistoryPage, type MessageAttachment, type Project, type ProjectSession, type PublicSettings, type QueuedChat, type QueuedChatEdit, type Run, type RunIntent, type SessionActivity, type SessionSearchMatch, type SessionTurnSummary, type TurnFileChange, type WorkspaceFrame, type WorkspaceSnapshot } from "@/lib/studio/types";
 import { descendantRunIds, isActiveRun, projectChatFlow } from "@/lib/studio/conversation";
 import { applyWorkspaceDelta, prependHistory } from "@/lib/studio/workspace-feed";
@@ -71,6 +71,9 @@ export default function Studio() {
   const [rename, setRename] = useState<{ id: string; title: string } | null>(null);
   const [renameIssue, setRenameIssue] = useState("");
   const [archiveConfirm, setArchiveConfirm] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteIssue, setDeleteIssue] = useState("");
   const [manageSessions, setManageSessions] = useState(false);
   const [sessionAction, setSessionAction] = useState(false);
   const [sessionArchive, setSessionArchive] = useState<{ id: string; activity: SessionActivity } | null>(null);
@@ -215,14 +218,17 @@ export default function Studio() {
     }).catch(error);
   }, [error]);
   useEffect(() => {
-    if (!projectId) return;
-    activeId.current = scope; localStorage.setItem("mujian.project", projectId);
-    localStorage.setItem("mujian.session." + projectId, sessionId);
+    activeId.current = scope;
+    if (projectId) {
+      localStorage.setItem("mujian.project", projectId);
+      localStorage.setItem("mujian.session." + projectId, sessionId);
+    }
     setHistorySearch(null); setMatches(null); setRename(null); setOutlineOpen(false); setManageSessions(false); jumpMessage.current = "";
     setComposerCaret(undefined); setSkillCommands([]);
     historySearchRequest.current?.abort();
     workspace.current = null;
     previewRequest.current++; setVersionedFile(null); setFileId(null); setReview(null); setSnapshot(null); setLoadingHistory(false); historyAnchor.current = null; setHistorySteps([]); setFolders({}); setNotice("");
+    if (!projectId) return;
     let closed = false, source: EventSource | undefined, reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     const connect = () => {
       const cursor = workspace.current?.cursor;
@@ -366,6 +372,41 @@ export default function Studio() {
         else { setArchiveConfirm(null); error(e); }
       }
     } finally { setArchiving(false); }
+  };
+  const deleteProject = async () => {
+    if (!deleteTarget || deleting) return;
+    const id = deleteTarget.id;
+    setDeleting(true);
+    setDeleteIssue("");
+    try {
+      await api("/projects/" + id, { method: "DELETE" });
+    } catch (e) {
+      if (!(e instanceof RequestError && e.code === "PROJECT_NOT_FOUND")) {
+        setDeleteIssue((e as Error).message);
+        return;
+      }
+    } finally { setDeleting(false); }
+
+    const remaining = projects.filter((item) => item.id !== id);
+    setProjects((items) => items.filter((item) => item.id !== id));
+    setSessionMatches((items) => items.filter((item) => item.projectId !== id));
+    setDeleteTarget(null);
+    localStorage.removeItem("mujian.session." + id);
+    if (localStorage.getItem("mujian.project") === id) localStorage.removeItem("mujian.project");
+    for (const [storage, prefix] of [[localStorage, "mujian.chat-draft."], [sessionStorage, "mujian.chat-echoes."]] as const) {
+      for (let index = storage.length - 1; index >= 0; index--) {
+        const key = storage.key(index);
+        if (key === prefix + id || key?.startsWith(prefix + id + "/")) storage.removeItem(key);
+      }
+    }
+    const archivedFallback = remaining.find((item) => item.status === "archived");
+    if (!archivedFallback) setShowArchived(false);
+    if (activeId.current.split("/")[0] === id) {
+      const next = (showArchived ? archivedFallback : undefined) ?? remaining.find((item) => item.status !== "archived") ?? archivedFallback;
+      setProjectId(next?.id ?? "");
+      setSessionId(next ? localStorage.getItem("mujian.session." + next.id) ?? "" : "");
+      setShowArchived(next?.status === "archived");
+    }
   };
   const importProject = async (file?: File) => {
     if (!file || importing) return;
@@ -676,10 +717,12 @@ export default function Studio() {
         </div>)}
       </nav> : <><div className="sidebar-label"><button className="text-button" aria-pressed={!showArchived} onClick={() => setShowArchived(false)}>项目</button>
         {projects.some((p) => p.status === "archived") && <button className="text-button" aria-pressed={showArchived} onClick={() => setShowArchived(true)}>归档</button>}</div>
-        <nav aria-label="项目列表">{projects.filter((p) => (p.status === "archived") === showArchived).map((p) => <div className="project-group" key={p.id}>
+        <nav aria-label={showArchived ? "归档项目" : "项目列表"}>{projects.filter((p) => (p.status === "archived") === showArchived).map((p) => <div className="project-group" key={p.id}>
           <button className={"project-item " + (p.id === projectId ? "selected" : "")} title={p.title} onClick={() => { if (projectId !== p.id) { setSessionId(localStorage.getItem("mujian.session." + p.id) ?? ""); setProjectId(p.id); } }} aria-current={p.id === projectId ? "page" : undefined}>
             <Folder size={15} strokeWidth={1.6}/>
             <span>{p.title}</span>{p.isExample && <small>示例</small>}</button>
+          {showArchived && <button type="button" className="icon-button project-delete" title="永久删除" aria-label={"永久删除「" + p.title + "」"}
+            onClick={() => { setDeleteIssue(""); setDeleteTarget(p); }}><Trash2 size={15} strokeWidth={1.6}/></button>}
         </div>)}</nav></>}
       </div>
       <button className="settings-button" onClick={() => setShowSettings(true)}><Settings2 size={17}/><span>设置</span><small>{settings?.textConnected ? "" : "未连接模型"}</small></button>
@@ -970,6 +1013,16 @@ export default function Studio() {
         <div className="extension-actions">
           <button className="button" type="button" disabled={archiving} onClick={() => setArchiveConfirm(null)}>取消</button>
           <button className="button" type="button" disabled={archiving} onClick={() => void archiveProject(true)}>暂停并归档</button>
+        </div>
+      </div>
+    </Modal>}
+    {deleteTarget && <Modal title="永久删除项目" compact busy={deleting} onClose={() => setDeleteTarget(null)}>
+      <div className="project-delete-confirm" aria-busy={deleting}>
+        <p><strong>「{deleteTarget.title}」</strong>的文件、对话和任务记录将被永久删除。此操作无法撤销。</p>
+        {deleteIssue && <p className="conversation-rename-error" role="alert">{deleteIssue}</p>}
+        <div className="conversation-rename-actions">
+          <button className="button" type="button" data-dialog-autofocus disabled={deleting} onClick={() => setDeleteTarget(null)}>取消</button>
+          <button className="button primary" type="button" disabled={deleting} onClick={() => void deleteProject()}>{deleting ? "正在删除…" : "永久删除"}</button>
         </div>
       </div>
     </Modal>}
