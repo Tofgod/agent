@@ -13,9 +13,9 @@ sh setup.sh
 日常启动：
 
 ```sh
-bash start.command
+sh start.sh
 ```
 
-macOS 也可以双击 `start.command`。启动后打开 [http://127.0.0.1:5179](http://127.0.0.1:5179)。在启动终端按 `Ctrl+C` 停止服务。
+启动后打开 [http://127.0.0.1:5179](http://127.0.0.1:5179)。在启动终端按 `Ctrl+C` 停止服务。
 
-端口被占用时，可运行 `DOMAN_PORT=5180 bash start.command`，然后访问 [http://127.0.0.1:5180](http://127.0.0.1:5180)。
+端口被占用时，可运行 `DOMAN_PORT=5180 sh start.sh`，然后访问 [http://127.0.0.1:5180](http://127.0.0.1:5180)。

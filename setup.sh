@@ -2,4 +2,4 @@
 set -eu
 
 CDPATH= cd -P "$(dirname "$0")"
-exec /bin/bash ./start.command --setup "$@"
+exec /bin/sh ./start.sh --setup "$@"
