@@ -8,6 +8,7 @@ const ARK_RESOLUTIONS = ["480p", "720p", "1080p", "4k"] as const;
 const MINIMAX_RESOLUTIONS = ["480P", "768P", "2K"] as const;
 const RESOLUTIONS = [...ARK_RESOLUTIONS, ...MINIMAX_RESOLUTIONS] as const;
 export const OMNI_TASK_TYPES = ["auto", "reference", "edit", "extend"] as const;
+export const H3_MAX_PROMPT_EXPANSION = ["disabled", "balanced", "quality"] as const;
 
 export const videoOptions = z.object({
   resolution: z.enum(RESOLUTIONS).optional(),
@@ -20,6 +21,7 @@ export const videoOptions = z.object({
   priority: z.number().int().min(0).max(9).optional(),
   execution_expires_after: z.number().int().min(3600).max(259200).optional(),
   tools: z.array(z.object({ type: z.literal("web_search") }).strict()).max(1).optional(),
+  extra: z.strictObject({ prompt_expansion_mode: z.enum(H3_MAX_PROMPT_EXPANSION).optional() }).optional(),
 });
 export type VideoOptions = z.infer<typeof videoOptions>;
 type ResolvedVideoOptions = VideoOptions & { resolution: typeof RESOLUTIONS[number]; duration?: number; ratio?: VideoRatio };
@@ -68,6 +70,7 @@ export function videoRequestOptions(model: VideoModel, prompt: string, refs: Vid
 
   if (!resolutions.includes(resolution))
     throw new AppError("当前模型可用分辨率：" + resolutions.join("、"), 400, "RESOLUTION_UNSUPPORTED");
+  if (options.extra !== undefined && model !== "MiniMax-H3-Max") throw new AppError("extra 仅适用于 MiniMax-H3-Max");
   if (!seedance && (options.watermark !== undefined || options.return_last_frame !== undefined || options.priority !== undefined ||
     options.execution_expires_after !== undefined || options.tools !== undefined))
     throw new AppError("当前 MiniMax 模型不支持这些 Seedance 参数");
@@ -95,10 +98,10 @@ export function videoRequestOptions(model: VideoModel, prompt: string, refs: Vid
   const effectiveDuration = duration ?? (seedance ? -1 : undefined);
   if (effectiveDuration === undefined || !Number.isInteger(effectiveDuration) ||
     (!(seedance && effectiveDuration === -1) && (effectiveDuration < min || effectiveDuration > max)))
-    throw new AppError("当前视频模型要求单镜头 " + min + "–" + max + " 秒" + (seedance ? "，也可用 -1 自动选择" : ""), 409, "DURATION_UNSUPPORTED");
+    throw new AppError(model + " 单次生成支持 " + min + "–" + max + " 秒" + (seedance ? "，也可用 -1 自动选择" : ""), 409, "DURATION_UNSUPPORTED");
   if (mode === "edit" && effectiveDuration !== -1) throw new AppError("视频编辑的 duration 必须为 -1");
 
-  let effectiveRatio = ratio ?? fallbackRatio;
+  let effectiveRatio = ratio ?? (!seedance && multimodal ? "adaptive" : fallbackRatio);
   if (editOrExtend || (v25 || !seedance) && frames) effectiveRatio = "adaptive";
   if (editOrExtend && ratio && ratio !== "adaptive") throw new AppError("视频编辑和延长的 ratio 必须为 adaptive");
   if (!seedance && !frames && !multimodal && effectiveRatio === "adaptive") throw new AppError("MiniMax 文生视频需要具体宽高比");

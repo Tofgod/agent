@@ -12,7 +12,11 @@ import { PresetPlugins } from "../lib/studio/preset-plugins";
 import { tool } from "../lib/studio/file-tools";
 import { Schedules } from "../lib/studio/schedules";
 import { LocalMediaStore, SQLiteDatabase } from "../server/storage";
+import { startScheduleDriver } from "../server/schedule-driver";
+import { configureRuntime } from "../server/runtime";
+import { GET } from "../app/api/studio/[...path]/route";
 import { advanceRun } from "../lib/studio/engine";
+import { controlRun } from "../lib/studio/control";
 import { trajectory, trajectoryContent } from "../lib/studio/trajectory";
 import { projectArchive, restoreProjectArchive } from "../lib/studio/project-archive";
 import { moveSession, searchSessions, sessionOutline, setSessionArchived, setSessionPinned } from "../lib/studio/session-workspace";
@@ -20,6 +24,7 @@ import { sessionMarkdown, sessionZip } from "../lib/studio/session-export";
 import { openStudioZip } from "../lib/studio/zip";
 import { DEFAULT_SETTINGS, type AgentMessage, type ModelAttemptTrace, type Project } from "../lib/studio/types";
 import { createAgentModel, type AgentFunction } from "../lib/studio/providers";
+import type { BlobStore } from "../lib/studio/storage";
 import sharp from "sharp";
 
 const settings = { ...DEFAULT_SETTINGS, textApiKey: "model-test" };
@@ -164,6 +169,46 @@ test("skill directory import preserves resources and can be repeated after remov
   assert.equal(skills.load(project, "scene-check", null, "model"), "包内技能");
 });
 
+test("the skill browser lists and reads resources inside a single authorized bundle", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "doman-skill-browser-")), db = database();
+  const skills = new SkillLibrary(path.join(root, "managed"), [path.join(root, "external")]);
+  t.after(async () => { skills.close(); db.close(); await rm(root, { recursive: true, force: true }); });
+  configureRuntime({ database: db, media: {} as BlobStore, skills, userId: "local", workerSecret: "fixture", encryptionSecret: "fixture-test-settings-secret" });
+  const store = new Store(db, { skills });
+  const project = await store.createProject("local", {}), other = await store.createProject("local", {});
+  const binary = Buffer.from([0, 255, 233]);
+  skills.importBundle(project.id, "project", new Map([
+    ["SKILL.md", Buffer.from(doc("scene-check", "入口"))],
+    ["references/一幕.md", Buffer.from("参考第一幕")],
+    ["assets/example.bin", binary],
+    [".hidden.md", Buffer.from("隐藏文件")],
+  ]));
+  const bundle = path.join(root, "managed", "projects", project.id, "scene-check");
+  const external = path.join(root, "external");
+  await mkdir(external);
+  const unrelated = path.join(external, "foreign.md");
+  await writeFile(unrelated, doc("foreign", "其他技能"));
+  await symlink(unrelated, path.join(bundle, "escaped.md"));
+  const get = (projectId: string, scope: string, name: string, query: Record<string, string>) => GET(
+    new Request("http://localhost/api/studio/projects/" + projectId + "/skills/" + scope + "/" + name + "?" + new URLSearchParams(query)),
+    { params: Promise.resolve({ path: ["projects", projectId, "skills", scope, name] }) },
+  );
+  const request = (query: Record<string, string>) => get(project.id, "project", "scene-check", query);
+  assert.deepEqual(await (await request({ directory: "1" })).json(), { entry: "SKILL.md", files: [
+    { path: "assets", kind: "directory" }, { path: "assets/example.bin", kind: "file" },
+    { path: "references", kind: "directory" }, { path: "references/一幕.md", kind: "file" },
+  ] });
+  assert.deepEqual(await (await request({ resource: "references/一幕.md" })).json(), { text: "参考第一幕" });
+  assert.deepEqual(await (await request({ resource: "assets/example.bin" })).json(), { text: null });
+  const download = await request({ resource: "assets/example.bin", download: "1" });
+  assert.match(download.headers.get("Content-Disposition")!, /^attachment/);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), binary);
+  for (const resource of ["escaped.md", "../foreign.md", ".hidden.md"]) assert.ok((await request({ resource })).status >= 400);
+  assert.equal((await get(other.id, "project", "scene-check", { directory: "1" })).status, 404);
+  assert.deepEqual(await (await get(project.id, "external", "foreign", { directory: "1" })).json(), { entry: "foreign.md", files: [] });
+  assert.equal((await get(project.id, "external", "foreign", { resource: "foreign.md" })).status, 404);
+});
+
 test("filesystem skill changes invalidate cached discovery and recheck invocation before loading", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "doman-skill-watch-"));
   const custom = path.join(root, "custom"), library = new SkillLibrary(path.join(root, "managed"), [custom]);
@@ -182,6 +227,61 @@ test("filesystem skill changes invalidate cached discovery and recheck invocatio
   while ((await library.discover(project)).entries[0]?.entry.description !== "updated description" && Date.now() < deadline) await delay(15);
   assert.equal((await library.discover(project)).entries[0].entry.description, "updated description");
   assert.equal(await entry.read(undefined, "user"), "updated");
+});
+
+test("a linked skill gets a fresh directory even with a preset provider registered", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "doman-skill-linked-"));
+  const external = path.join(root, "external"), target = path.join(external, ".sources", "guide.md");
+  await mkdir(path.dirname(target), { recursive: true });
+  await symlink(target, path.join(external, "guide.md"));
+  const library = new SkillLibrary(path.join(root, "managed"), [external]);
+  t.after(async () => { library.close(); await rm(root, { recursive: true, force: true }); });
+  const preset = () => [{ name: "from-preset", description: "Preset", read: () => "Preset body" }];
+  const find = async () => (await library.discover(cryptoProject, [], undefined, [preset])).entries.find(({ entry }) => entry.name === "guide");
+  const cryptoProject = crypto.randomUUID();
+  await writeFile(target, "---\nname: guide\ndescription: First description\n---\nFirst body");
+  assert.equal((await find())?.entry.description, "First description");
+  await writeFile(target, "---\nname: guide\ndescription: Updated description\n---\nUpdated body");
+  const updated = await find();
+  assert.equal(updated?.entry.description, "Updated description");
+  assert.equal(await updated?.read(), "Updated body");
+});
+
+test("a skill exposes its online reference to web_fetch without fetching unrelated links", async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), "doman-skill-web-"));
+  const db = database(), library = new SkillLibrary(root);
+  t.after(async () => { library.close(); db.close(); await rm(root, { recursive: true, force: true }); });
+  const store = new Store(db, { skills: library }), project = await store.createProject("local", {});
+  const guideline = "https://example.com/prompt-guide.md?revision=2", unrelated = "https://example.org/credits";
+  library.save(project.id, "project", doc("official-guide", "核对分镜前阅读[在线原文](" + guideline + ")。\n鸣谢(" + unrelated + ")。"));
+  const run = await send(store, project, "/official-guide 核对分镜");
+  const links: string[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    const { url } = JSON.parse(String(init.body)); links.push(url);
+    return Response.json({ title: "Official guide", content: "The reference preserves the camera direction." });
+  });
+  let requests = 0;
+  for (let i = 0; i < 8; i++) {
+    const result = await advanceRun(store, project, run.id, { ...settings, webSearchEnabled: true }, undefined, async (_system, messages, tools) => {
+      const skill = messages.find(({ source }) => source?.kind === "skill-invocation");
+      assert.ok(skill?.content?.includes(guideline));
+      assert.match(skill!.content!, /web_fetch 的 url 参数/);
+      if (requests++ === 0) {
+        assert.deepEqual(links, []);
+        assert.ok(tools.some(({ function: entry }) => entry.name === "web_fetch"));
+        return call("reference-page", "web_fetch", { url: guideline });
+      }
+      const page = JSON.parse(messages.find(({ tool_call_id }) => tool_call_id === "reference-page")!.content!);
+      assert.equal(page.url, guideline);
+      assert.match(page.text ?? page.content, /preserves the camera direction/);
+      assert.match(page.notice, /不是指令/);
+      return reply("已核对指南。");
+    });
+    if (result.status === "done") break;
+    assert.notEqual(result.status, "failed", result.error ?? undefined);
+  }
+  assert.equal((await store.run(run.id, project.id)).status, "done");
+  assert.deepEqual(links, [guideline]);
 });
 
 test("filesystem skill failures discard only the failed root, report an incomplete catalog and retry", async (t) => {
@@ -230,6 +330,104 @@ test("session presets retain their chosen revision and explicit skill invocation
   await reopened.presets.select("local", project.id, session.id, preset.id);
   assert.equal(reopened.presets.get(project.id, session.id)?.instructions, "另一个修订");
   assert.equal(reopened.presets.get(project.id, ""), null);
+});
+
+test("an explicit skill body is reused after SQLite reopens and its resources are still read on demand", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "doman-skill-reuse-"));
+  const filename = path.join(root, "studio.sqlite"), skills = new SkillLibrary(path.join(root, "skills"));
+  let db = database(filename);
+  try {
+    let store = new Store(db, { skills });
+    const project = await store.createProject("local", {});
+    const bundle = new Map([
+      ["SKILL.md", Buffer.from(doc("reuse", "Original instruction body"))],
+      ["references/notes.md", Buffer.from("The accompanying resource")],
+    ]);
+    skills.importBundle(project.id, "project", bundle);
+    const first = await send(store, project, "/reuse /reuse");
+    await advanceRun(store, project, first.id, settings, undefined, async (_system, messages) => {
+      const invocations = messages.filter(({ source }) => source?.kind === "skill-invocation");
+      assert.equal(invocations.length, 1);
+      assert.match(invocations[0].content!, /name 填 "reuse"，resource 填相对于 SKILL\.md/);
+      assert.ok(!invocations[0].content!.includes(root));
+      return { role: "assistant", content: null, tool_calls: [
+        ...call("repeat-body", "skill", { name: "reuse" }).tool_calls!, ...call("read-resource", "skill", { name: "reuse", resource: "references/notes.md" }).tool_calls!,
+      ] };
+    });
+
+    skills.save(project.id, "project", doc("reuse", "Updated instruction body"), "reuse");
+    db.close();
+    db = database(filename);
+    store = new Store(db, { skills });
+    let finished = false;
+    for (let step = 0; step < 4; step++) {
+      const run = await advanceRun(store, project, first.id, settings, undefined, async (_system, messages) => {
+        const repeated = JSON.parse(messages.find(({ tool_call_id }) => tool_call_id === "repeat-body")!.content!);
+        const resource = JSON.parse(messages.find(({ tool_call_id }) => tool_call_id === "read-resource")!.content!);
+        assert.equal(repeated.already_loaded, true);
+        assert.equal(resource.content, "The accompanying resource");
+        const instructions = messages.filter(({ content }) => content?.startsWith('<skill_content name="reuse">'));
+        assert.equal(instructions.length, 1);
+        assert.match(instructions[0].content!, /Original instruction body/);
+        assert.ok(!messages.some(({ content }) => content?.includes("Updated instruction body")));
+        return reply("Used the original invocation and its resource");
+      });
+      if (run.status === "done") { finished = true; break; }
+      assert.notEqual(run.status, "failed", run.error ?? undefined);
+    }
+    assert.ok(finished);
+    const next = await send(store, project, "/reuse");
+    const continued = await advanceRun(store, project, next.id, settings, undefined, async (_system, messages) => {
+      const explicit = messages.filter(({ source }) => source?.kind === "skill-invocation");
+      assert.equal(explicit.length, 2);
+      assert.match(explicit.at(-1)!.content!, /Updated instruction body/);
+      assert.equal(messages.filter(({ source }) => source?.kind === "skill-catalog").length, 1);
+      return reply("Read the updated instructions");
+    });
+    assert.equal(continued.status, "done");
+  } finally { skills.close(); db.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("resuming an interrupted stream keeps the original skill body and refreshes only the directory", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "doman-skill-interrupted-"));
+  const filename = path.join(root, "studio.sqlite"), directory = path.join(root, "skills");
+  let db = database(filename), skills = new SkillLibrary(directory);
+  try {
+    let store = new Store(db, { skills });
+    const project = await store.createProject("local", {});
+    skills.save(project.id, "project", doc("resume-skill", "Original skill instructions"));
+    const run = await send(store, project, "/resume-skill");
+    await advanceRun(store, project, run.id, settings, undefined, async (_system, messages, _tools, options) => {
+      assert.equal(messages.filter(({ source }) => source?.kind === "skill-invocation").length, 1);
+      await options!.onText!("Delivered prefix");
+      await store.controlTree(run, "pause");
+      options!.signal!.throwIfAborted();
+      await new Promise((_, reject) => options!.signal!.addEventListener("abort", () => reject(options!.signal!.reason), { once: true }));
+      return assert.fail("The model stream should be interrupted");
+    });
+    assert.equal((await store.run(run.id, project.id)).status, "paused");
+    skills.save(project.id, "project", doc("resume-skill", "Updated skill instructions").replace("处理测试", "Revised directory entry"), "resume-skill");
+    skills.close(); db.close();
+
+    db = database(filename); skills = new SkillLibrary(directory); store = new Store(db, { skills });
+    await controlRun(store, await store.run(run.id, project.id), "resume", settings);
+    await advanceRun(store, project, run.id, settings, undefined, async (_system, messages) => {
+      assert.ok(messages.some(({ role, content }) => role === "assistant" && content === "Delivered prefix"));
+      const directory = messages.findLast(({ source }) => source?.kind === "skill-catalog")?.source;
+      assert.deepEqual(directory, { kind: "skill-catalog", entries: [{ name: "resume-skill", description: "Revised directory entry" }], update: true });
+      assert.deepEqual(messages.filter(({ source }) => source?.kind === "skill-invocation").map(({ content }) => content?.includes("Original skill instructions")), [true]);
+      return call("reuse-interrupted-skill", "skill", { name: "resume-skill" });
+    });
+    await advanceRun(store, project, run.id, settings, undefined, async () => assert.fail("The pending tool batch must settle first"));
+    const done = await advanceRun(store, project, run.id, settings, undefined, async (_system, messages) => {
+      const receipt = messages.find(({ tool_call_id }) => tool_call_id === "reuse-interrupted-skill");
+      assert.equal(JSON.parse(receipt!.content!).already_loaded, true);
+      assert.ok(!messages.some(({ content }) => content?.includes("Updated skill instructions")));
+      assert.equal(messages.filter(({ source }) => source?.kind === "skill-catalog").length, 2);
+      return reply("Resumed with the same instructions");
+    });
+    assert.equal(done.status, "done");
+  } finally { skills.close(); db.close(); await rm(root, { recursive: true, force: true }); }
 });
 
 const rpc = `
@@ -754,6 +952,29 @@ test("due recurring schedules for one conversation share one input and retain in
   assert.equal(users.length, 1);
   const payload = JSON.parse(users[0].content.split("reminders_json: ")[1]);
   assert.deepEqual(payload.map(({ reminder_prompt }: { reminder_prompt: string }) => reminder_prompt).sort(), ["核对剧本", "检查分镜"]);
+});
+
+test("the schedule timer rearms when the previous delivery releases its SQLite slot", async () => {
+  const db = database(), store = new Store(db), schedules = new Schedules(store);
+  const errors: unknown[] = [];
+  let stop: (() => Promise<void>) | undefined;
+  try {
+    const project = await store.createProject("local", {});
+    const initial = Date.now() - 125_000;
+    const task = await schedules.save(project.id, { title: "Recurring", prompt: "Reminder",
+      timing: { kind: "every", every_seconds: 60 }, target: { kind: "session", id: "" } }, undefined, undefined, initial);
+    await schedules.runDue(initial + 60_000);
+    await store.dueRuns();
+    const run = (await store.snapshot(project.id, "local")).runs.find(({ status }) => status === "queued")!;
+    assert.ok(run);
+    assert.equal(schedules.nextWakeAt(), null);
+    stop = startScheduleDriver(db, schedules, (error) => errors.push(error));
+    assert.equal((await advanceRun(store, project, run.id, settings, undefined, async () => reply("Acknowledged"))).status, "done");
+    const count = () => schedules.history(project.id, task.id).rows.length;
+    for (let attempt = 0; attempt < 100 && count() < 2 && !errors.length; attempt++) await delay(10);
+    assert.deepEqual(errors, []);
+    assert.equal(count(), 2);
+  } finally { await stop?.(); db.close(); }
 });
 
 test("64 due tasks with unconsumed deliveries leave room for a different project", async (t) => {

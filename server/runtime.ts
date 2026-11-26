@@ -11,7 +11,7 @@ import type { PresetPlugins } from "../lib/studio/preset-plugins";
 import type { TextModelResolver } from "../lib/studio/providers";
 export interface Runtime { database: Database; media: BlobStore; encryptionSecret: string; workerSecret: string; userId: string; agents?: readonly AgentDefinition[]; disk?: ProjectDisk;
   skills?: SkillLibrary; mcp?: McpManager; presetPlugins?: PresetPlugins; scheduleToolsEnabled?: boolean; schedulePolicy?: SchedulePolicy; resolveModel?: TextModelResolver;
-  contextWindow?: number; compaction?: CompactionConfig; modelRetry?: ModelRetryConfig; maxParallelTools?: number; maxDelegationDepth?: number; maxConsecutiveWakes?: number; jobWaitTimeout?: number; maxJobWaitTimeout?: number; completionDelivery?: "quiet" | "wakeup" }
+  contextWindow?: number; compaction?: CompactionConfig; modelRetry?: ModelRetryConfig; maxParallelTools?: number; maxDelegationDepth?: number; maxConsecutiveWakes?: number; maxConcurrentJobsPerOwner?: number; jobWaitTimeout?: number; maxJobWaitTimeout?: number; completionDelivery?: "quiet" | "wakeup" }
 let runtime: Runtime | undefined;
 export function configureRuntime(value: Runtime) { runtime = value; }
 export function getRuntime() {

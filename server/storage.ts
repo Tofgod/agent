@@ -59,6 +59,26 @@ export class SQLiteDatabase implements Database {
       catch (error) { this.connection.exec("ROLLBACK"); throw error; }
     }
   }
+  watchSchedules(onChange: () => void) {
+    let queued = false, listening = true;
+    const operations = ["INSERT", "UPDATE", "DELETE"] as const;
+    // TEMP triggers also observe slot releases written by other SQLite triggers on this connection.
+    // Refresh after the synchronous write or transaction finishes, never inside it.
+    this.connection.function("studio_schedule_changed", () => {
+      if (!queued) {
+        queued = true;
+        queueMicrotask(() => { queued = false; if (listening) onChange(); });
+      }
+      return null;
+    });
+    for (const operation of operations)
+      this.connection.exec(`CREATE TEMP TRIGGER studio_schedule_watch_${operation} AFTER ${operation} ON main.studio_schedules
+        BEGIN SELECT studio_schedule_changed(); END`);
+    return () => {
+      listening = false;
+      for (const operation of operations) this.connection.exec(`DROP TRIGGER temp.studio_schedule_watch_${operation}`);
+    };
+  }
   releaseAbandonedLeases(options: { interruptAgentTurns?: boolean } = {}) {
     const owners = this.connection.prepare("SELECT DISTINCT lease_owner FROM runs WHERE lease_owner>0 AND lease_until>0").all();
     const interrupted = "status='running' AND agent_role<>'media' AND stage IN ('agent','maintenance')";

@@ -17,7 +17,8 @@ export interface ChildExecution {
   preset?: SessionPreset;
 }
 
-export const childModel = z.object({ provider: z.enum(["chat-completions", "messages"]), model: z.literal("deepseek-flash"), reasoning_effort: z.enum(reasoningEfforts).optional() }).strict();
+const childReasoningEfforts = ["off", ...reasoningEfforts] as const;
+export const childModel = z.object({ provider: z.enum(["chat-completions", "messages"]), model: z.literal("deepseek-flash"), reasoning_effort: z.enum(childReasoningEfforts).optional() }).strict();
 const childSchema = z.unknown().transform((value): ObjectJsonSchema => {
   try { assertObjectJsonSchema(value); return value; }
   catch (error) {
@@ -30,7 +31,7 @@ export const childFields = {
   provider: childModel.shape.provider.optional(), model: childModel.shape.model.optional(), reasoning_effort: childModel.shape.reasoning_effort, output_schema: childSchema.optional(),
   agent_preset: z.string().uuid().optional(),
 };
-type ChildOptions = { cwd?: string; provider?: keyof typeof providers; model?: "deepseek-flash"; reasoning_effort?: ReasoningEffort; output_schema?: ObjectJsonSchema };
+type ChildOptions = { cwd?: string; provider?: keyof typeof providers; model?: "deepseek-flash"; reasoning_effort?: ReasoningEffort | "off"; output_schema?: ObjectJsonSchema };
 
 export function childParameters(settings: ProviderSettings) {
   return {
@@ -38,25 +39,27 @@ export function childParameters(settings: ProviderSettings) {
     ...(official(settings.textBaseUrl) ? {
       provider: { type: "string", enum: Object.keys(providers), description: "明确要求独立协议时与 model 一起填写。默认继承当前线路。" },
       model: { type: "string", enum: ["deepseek-flash"] },
-      reasoning_effort: { type: "string", enum: reasoningEfforts, description: "为该子任务开启推理并选择强度。同线路省略时继承当前强度，换线路后使用该线路默认强度。" },
+      reasoning_effort: { type: "string", enum: childReasoningEfforts, description: "仅与 provider、model 一起填写。off 关闭推理。显式指定线路但省略强度时使用线路默认值；三个字段均省略时沿用角色配置或继承兼容的父任务设置。" },
     } : {}),
     output_schema: { type: "object", description: "仅为需要返回机器可读数据的任务指定对象型 JSON Schema。创作文档仍按项目约定保存。" },
   };
 }
 
 export function childExecution(options: ChildOptions, settings: ProviderSettings, definition?: AgentDefinition, parentCwd?: string): ChildExecution {
-  if (Boolean(options.provider) !== Boolean(options.model)) throw new AppError("provider 和 model 需要一起提供", 400, "INVALID_ARGS");
+  if (Boolean(options.provider) !== Boolean(options.model) || (options.reasoning_effort && !options.provider))
+    throw new AppError("provider 和 model 需要一起提供，reasoning_effort 需要同时指定两者", 400, "INVALID_ARGS");
   const selection = options.provider ? { provider: options.provider, model: options.model! } : definition?.textRoute;
   const inheritedProvider = isMessagesRoute(settings.textBaseUrl) ? "messages" : "chat-completions";
   const routeChanged = selection && (selection.provider !== inheritedProvider || selection.model !== settings.textModel);
-  const effort = options.reasoning_effort ?? (!options.provider ? definition?.textRoute?.reasoning_effort : undefined) ??
-    (routeChanged ? undefined : settings.textReasoningEffort);
-  if ((selection || effort) && !official(settings.textBaseUrl)) throw new AppError("当前 DeepSeek 凭据只能用于现有服务的线路", 403, "AGENT_ROUTE_UNAVAILABLE");
+  const effort = options.provider ? options.reasoning_effort :
+    definition?.textRoute?.reasoning_effort ?? (routeChanged ? undefined : settings.textReasoningEffort);
+  if (selection && !official(settings.textBaseUrl)) throw new AppError("当前 DeepSeek 凭据只能用于现有服务的线路", 403, "AGENT_ROUTE_UNAVAILABLE");
   const baseUrl = selection ? providers[selection.provider] : settings.textBaseUrl;
   const cwd = options.cwd ? projectRelativePath(options.cwd, parentCwd) : parentCwd;
   if (cwd && cwd !== "/" && !PROJECT_FOLDERS.some(({ path }) => cwd === path || cwd.startsWith(path + "/")))
     throw new AppError("工作目录应位于当前项目的一级目录下", 400, "INVALID_PATH");
-  return { ...(cwd ? { cwd } : {}), route: { baseUrl, model: selection?.model ?? settings.textModel, thinking: Boolean(effort) || (isMessagesRoute(baseUrl) && settings.textThinking === true), ...(effort ? { effort } : {}) },
+  const thinking = effort !== "off" && (Boolean(effort) || (isMessagesRoute(baseUrl) && settings.textThinking === true));
+  return { ...(cwd ? { cwd } : {}), route: { baseUrl, model: selection?.model ?? settings.textModel, thinking, ...(effort && effort !== "off" ? { effort } : {}) },
     ...(options.output_schema ? { outputSchema: options.output_schema } : {}) };
 }
 

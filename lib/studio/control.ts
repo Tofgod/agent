@@ -7,6 +7,7 @@ export async function controlTaskFromTool(store: Store, target: Run, action: "pa
   if (target.projectId !== caller.run.projectId) throw new AppError("只能控制当前项目的任务", 403, "TASK_NOT_REACHABLE");
   const cached = await store.toolResult(caller.run.id, caller.callId);
   if (cached) return cached;
+  await store.assertTaskControl(caller.run, target);
   await controlRun(store, target, action, settings, caller);
   const receipt = await store.toolResult(caller.run.id, caller.callId);
   if (receipt) return receipt;
@@ -32,7 +33,7 @@ export async function controlRun(store: Store, run: Run, action: "pause" | "resu
     throw new AppError("原提交仍在执行或尚未核对，不能再次付费提交；请继续获取原任务结果", 409, "SUBMISSION_UNSETTLED");
   if (action === "resubmit" && (payload.providerTaskId || payload.outputUrl))
     throw new AppError("已有供应商任务或生成结果，请使用继续获取原结果", 409, "SUBMISSION_EXISTS");
-  payload = { ...payload, cancellation: undefined, stoppedBySessionArchive: undefined };
+  payload = { ...payload, cancellation: undefined, stoppedBySessionArchive: undefined, agentInterrupted: undefined };
   if (action === "resubmit") payload = { ...payload, submissionUnknown: false, providerTaskId: undefined, outputUrl: undefined, outputDuration: undefined, pendingArtifactId: undefined, submissionId: undefined };
   else if (payload.providerTaskId && payload.mediaProvider && !payload.outputUrl && run.status === "failed") {
     const task = await queryMediaTask(settings, payload.mediaProvider, payload.providerTaskId, payload.providerBaseUrl);

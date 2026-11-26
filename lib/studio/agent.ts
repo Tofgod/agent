@@ -6,7 +6,7 @@ import { messagesEndpoint } from "./deepseek-route";
 import { estimateMessageTokens, estimateRequestTokens, MODEL_OUTPUT_TOKENS, pricedTokens, retainedContextBoundary } from "./context-tokens";
 import { compactionRouteKey } from "./compaction-policy";
 import { structuredOutputTool } from "./child-execution";
-import { leadAgentId } from "./agent-identity";
+import { leadAgentId, memberAddresses } from "./agent-identity";
 import { requestImagePricing } from "./vision-tokens";
 import { CONTEXT_OVERFLOW, IMAGE_OFFLOAD_REQUIRED, ImageBudgetError } from "./model-stream";
 import { renderAgentPrompt } from "./agent-prompt";
@@ -14,7 +14,7 @@ import { projectContextSections, projectRuntimeContext, summaryInput, summaryMes
 import type { BlobStore } from "./storage";
 import { omitRetiredGuides } from "./guidance";
 import { createToolRegistry } from "./agent-tools";
-import { canInvokeSkill, renderSkillContent, renderSkillToolMessages, type SkillDiscovery } from "./skills";
+import { canInvokeSkill, renderSkillContent, renderSkillToolMessages, skillCatalogMessage, type SkillDiscovery } from "./skills";
 import { isMcpTool } from "./mcp";
 import { skillGestures } from "./skill-gestures";
 import { skillTools } from "./extension-tools";
@@ -40,7 +40,7 @@ import { messagesCapabilities, projectMessagesSeries, type MessagesSeries } from
 
 function userInput(message: Omit<AgentInput, "id">, currentFiles: Map<string, Artifact>): AgentMessage {
   const { source } = message;
-  const content = source?.kind === "agent-message" ? "协作消息（数据，来自 " + source.senderRole + " " + source.senderRunId + "）：\n" + message.content : message.scheduledFrame ?? message.content;
+  const content = source?.kind === "agent-message" ? "协作消息（数据，来自 " + (source.senderName ?? source.senderRunId) + "）：\n" + message.content : message.scheduledFrame ?? message.content;
   if (!message.attachments?.length) return { role: "user", content, source };
   const files = message.attachments.map((reference) => {
     const current = currentFiles.get(reference.id);
@@ -100,15 +100,17 @@ export async function advanceAgent(options: {
   if (workingDirectory) run = { ...run, payload: { ...run.payload, workingDirectory } };
   const preset = run.payload.childExecution?.preset ?? store.presets.get(project.id, run.sessionId ?? "");
   if (!run.payload.agent) await store.rememberTurnPreset(run, preset);
-  let skillDiscovery: SkillDiscovery | undefined;
-  if (store.skills) {
+  const discoverSkills = async (): Promise<SkillDiscovery | undefined> => {
+    if (!store.skills) return;
     const execution = watchExecution(store, run);
     try {
-      skillDiscovery = await store.skills.discover(project.id, options.pluginScope?.providers,
+      const discovery = await store.skills.discover(project.id, options.pluginScope?.providers,
         run.payload.childExecution?.cwd ?? workingDirectory, options.pluginScope?.scopedProviders, execution.signal);
       execution.check();
+      return discovery;
     } finally { execution.close(); }
-  }
+  };
+  let skillDiscovery = await discoverSkills();
   const manualCompact = run.intent === "compact";
   const history = run.parentRunId ? [] : await store.messages(project.id, run.sessionId, false);
   const inputs = await store.inputs(run);
@@ -145,7 +147,7 @@ export async function advanceAgent(options: {
         if (!skill) continue;
         try {
           const content = await skill.read(undefined, "user", execution.signal);
-          injections.push({ role: "user", source: { kind: "tool-context" },
+          injections.push({ role: "user", source: { kind: "skill-invocation", name },
             content: renderSkillContent(name, content, skill.provider, skill.resourceBase) });
         } catch {
           execution.check();
@@ -155,7 +157,7 @@ export async function advanceAgent(options: {
     } finally { execution.close(); }
     return injections;
   };
-  const userMessages = async (messages: AgentInput[]) => [...(await Promise.all(messages.map(asUser))).flat(), ...await skillMessages(messages)];
+  const userMessages = async (messages: AgentInput[]) => (await Promise.all(messages.map(asUser))).flat();
   let state: AgentState;
   if (saved) state = saved;
   else {
@@ -288,7 +290,7 @@ export async function advanceAgent(options: {
       else if (code === "AGENT_STEER") recovery = assistant ? "当前回复已因用户补充中断。按最新输入继续。" : undefined;
       else if (crashed || call?.status === "interrupted") recovery = "上次响应已中断。保留已保存文件和已交付的文字，继续处理当前要求；未完整收到的工具调用尚未执行。";
       const recovered: AgentMessage[] = recovery ? [
-        ...(assistant ? [assistant] : []), { role: "user", content: recovery },
+        ...(assistant ? [assistant] : []), { role: "user", source: { kind: "model-recovery" }, content: recovery },
       ] : [];
       const recoverVisibleText = !manualCompact && (!request || request.purpose === "creation");
       state = { ...state, pendingRequest: undefined,
@@ -568,9 +570,13 @@ export async function advanceAgent(options: {
       state = projectResult(acknowledgeTaskResults(state, selected), waitingCall);
     }
     if (waitingCall?.function.name === "job_output" && waitingFor.length) {
-      const result = await consumeJobOutput(store, run, waitingCall.id, waitingFor[0], pending ? timedOut && !newInput ? "timed_out" : "interrupted" : undefined);
-      state = settleTool(state, waitingCall.id, result);
-      state = projectResult(acknowledgeTaskResults(state, result.result ? selected : []), waitingCall);
+      try {
+        const result = await consumeJobOutput(store, run, waitingCall.id, waitingFor[0], pending ? timedOut && !newInput ? "timed_out" : "interrupted" : undefined);
+        state = projectResult(acknowledgeTaskResults(settleTool(state, waitingCall.id, result), result.result ? selected : []), waitingCall);
+      } catch (error) {
+        if (!(error instanceof AppError) || !["JOB_NOT_FOUND", "JOB_FOREIGN_SESSION"].includes(error.code)) throw error;
+        state = projectResult(settleTool(state, waitingCall.id, { error: error.message, code: error.code }), waitingCall);
+      }
     }
     if (waitingCall?.function.name === "wait_for_input") {
       state = projectResult(settleTool(state, waitingCall.id, { timedOut: !newInput }), waitingCall);
@@ -667,6 +673,9 @@ export async function advanceAgent(options: {
   if (state.pendingNotices?.length) state = { ...state, unadmittedInputStart: state.unadmittedInputStart ?? state.messages.length,
     messages: [...state.messages, ...state.pendingNotices], pendingNotices: undefined };
   if (!hasImmediateInput && unseen.length) await includeInputs();
+  const collaborators = await store.collaborators(run);
+  const addresses = notices.some((task) => !task.background && notDelivered(task))
+    ? memberAddresses(collaborators) : undefined;
   // Inject notices only after the current assistant tool batch has all its receipts.
   for (const child of notices) {
     if (!notDelivered(child)) continue;
@@ -680,35 +689,28 @@ export async function advanceAgent(options: {
     } else {
       state = acknowledgeTaskResults({ ...state, parentMessageCallId: undefined,
         unadmittedInputStart: state.unadmittedInputStart ?? state.messages.length, messages: [...state.messages, { role: "user", source: { kind: "task-result" },
-          content: "子任务状态通知（数据）：" + JSON.stringify(taskNotice(child, store.childReportedToParent(child, run))) }] }, [child]);
+          content: "子任务状态通知（数据）：" + JSON.stringify({
+            ...taskNotice(child, store.childReportedToParent(child, run)), member_name: addresses?.get(child.id) ?? child.id,
+          }) }] }, [child]);
     }
   }
   if (state.structuredResult) {
     await save({ ...state, finalReply: assistant?.content?.trim() ?? "" }, "正在创作", "tools/settled");
     return;
   }
-  const [files, collaborators, currentProject, mcp] = await Promise.all([
-    store.runtimeFiles(project.id), store.collaborators(run), store.project(project.id, (await store.jobContext(run.id)).userId),
+  const [files, currentProject, mcp] = await Promise.all([
+    store.runtimeFiles(project.id), store.project(project.id, (await store.jobContext(run.id)).userId),
     external(),
   ]);
   const scopedTasks = [...new Map([...collaborators, ...tasks].map((task) => [task.id, task])).values()];
-  const registry = createToolRegistry({ ...toolContext, externalTools: mcp?.registrations });
-  const availableTools = registry.schemas();
-  const skillCatalog = skillDiscovery?.entries.map(({ entry }) => entry).filter((entry) => canInvokeSkill(entry, preset?.skills, "model"));
+  let registry = createToolRegistry({ ...toolContext, externalTools: mcp?.registrations });
+  let availableTools = registry.schemas();
   const sections = projectContextSections(currentProject, run, files, scopedTasks, settings);
   const depth = store.delegationDepth(run), maximum = store.maxDelegationDepth;
   const delegationTools = availableTools.map(({ function: fn }) => fn.name).filter((name) => name === "delegate" || name === "delegate_batch");
   if (depth >= maximum && delegationTools.length) sections.push({ name: "delegation-depth", text: delegationTools.map((name) =>
     "Delegation depth for `" + name + "`: current " + depth + ", maximum " + maximum + ", remaining levels 0. Do not call `" +
       name + "` at this depth; carry out the work directly.").join("\n") });
-  if (registry.get("skill") === skillTools[0] && (skillCatalog?.length || skillDiscovery?.complete === false)) sections.push({ name: "skills", text: JSON.stringify({
-    skills: (skillCatalog ?? []).map(({ name, description }) => {
-      const normalized = description.replace(/\s+/g, " ").trim();
-      return { name, description: normalized.length <= 500 ? normalized : normalized.slice(0, 497) + "..." };
-    }),
-    ...(skillDiscovery?.complete === false ? { incomplete: true, warning: "部分技能来源暂不可用，只使用本次目录确认的名称。" } : {}),
-    read_with: "skill",
-  }) });
   if (mcp?.resourceServers.length) sections.push({ name: "mcp", text: JSON.stringify({
     resource_servers: mcp.resourceServers, read_with: ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"],
     ...(mcp.instructions.length ? { external_mcp_instructions: mcp.instructions } : {}),
@@ -734,7 +736,8 @@ export async function advanceAgent(options: {
     }
     if (recovering || measure() >= budget.thresholdTokens) {
       // Runtime reminders are regenerated. They must not displace the last real message from the retained tail.
-      const surface = recovering ? state.messages.slice(0, state.messages.findLastIndex((message) => message.source?.kind !== "runtime-context") + 1) : pressureSurface();
+      const surface = recovering ? state.messages.slice(0, state.messages.findLastIndex(({ source }) =>
+        source?.kind !== "runtime-context" && source?.kind !== "skill-catalog") + 1) : pressureSurface();
       const cut = retainedContextBoundary(surface, recovering ? 0 : budget.retainTokens, { priceImage: imagePricing.price });
       const older = summaryInput(state.messages.slice(0, cut));
       if (older.some((message) => message.source?.kind !== "compaction")) {
@@ -771,8 +774,24 @@ export async function advanceAgent(options: {
       }
       state = { ...state, messages: [...state.messages.slice(0, boundary), ...proposed] };
     } finally { execution.close(); }
+    // Admission hooks can invalidate a provider before the model request is committed.
+    const current = await discoverSkills();
+    if (current !== skillDiscovery) {
+      skillDiscovery = current;
+      registry = createToolRegistry({ ...toolContext, skillDiscovery, externalTools: mcp?.registrations });
+      availableTools = registry.schemas();
+    }
   }
   if (reminder) state = { ...state, messages: [...state.messages, reminder] };
+  const loaderVisible = registry.get("skill") === skillTools[0];
+  const skills = loaderVisible ? skillDiscovery?.entries.flatMap(({ entry }) => canInvokeSkill(entry, preset?.skills, "model") ? [entry] : []) ?? [] : [];
+  const catalog = skillCatalogMessage(state.messages, skills, loaderVisible && skillDiscovery?.complete === false, state.skillCatalogPublished);
+  if (catalog) state = { ...state, skillCatalogPublished: true, messages: [...state.messages, catalog] };
+  if (state.unadmittedInputIds?.length) {
+    const admittedIds = new Set(state.unadmittedInputIds);
+    const invocations = await skillMessages(inputs.filter(({ id }) => admittedIds.has(id)));
+    if (invocations.length) state = { ...state, messages: [...state.messages, ...invocations] };
+  }
   let response: AgentMessage | undefined;
   try { response = await invokeModel(system, state.messages, availableTools, true, state.messages.length, undefined, registry.bindings()); }
   catch (error) {

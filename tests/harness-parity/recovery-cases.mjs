@@ -230,3 +230,41 @@ export const backgroundHistoryProbe = {
     "archived background jobs keep a stable history of status and output",
   ],
 };
+export const delegationParityProbe = {
+  names: ["a", "b"],
+  leaf: "edit",
+  route: { provider: "messages", model: "deepseek-flash" },
+  parentEffort: "high",
+  explicitEffort: "max",
+  configuredEffort: "max",
+  log: "delegated job output",
+  limit: 10,
+  cases: {
+    reasoning: "delegation selects the same effective reasoning for omitted and explicit routes",
+    names: "nested names belong to their creator and resolve from the conversation root",
+    output: "only the job owner can read or wait for background output",
+    capacity: "job capacity defaults to ten per owner and releases on settlement",
+  },
+};
+
+export const innerFlowProbe = {
+  wait: { case: "distinct input waits can report the same pending message without consuming it",
+    message: "fresh input", calls: ["wait-first", "wait-second"], invalid: 9_999, timeout: 10_000 },
+  tool: { case: "a missing media credential fails its own call and lets the next write settle",
+    unavailable: "media-unavailable", write: "write-after-media", code: "MEDIA_NOT_CONFIGURED", text: "independent written draft" },
+  control: { case: "ancestor interruption leaves deeper work running and the same child can continue",
+    a: "interruptible", b: "peer", leaf: "deeper", resume: "continue this same collaborator", done: "continuation accepted" },
+};
+
+export async function probeJobCapacity(start, stop, finish, limit) {
+  const active = await Promise.all(Array.from({ length: limit + 1 }, (_, i) => start("a", i).then(
+    (id) => ({ id }), (error) => ({ error: error.code }),
+  )));
+  const other = await start("b", limit);
+  const first = active.find(({ id }) => id).id;
+  await stop(first);
+  const stopping = await start("a", limit + 1).then(() => false, (error) => error.code);
+  await finish(first);
+  return { admitted: active.filter(({ id }) => id).length, refused: active.flatMap(({ error }) => error ? [error] : []),
+    separateOwner: Boolean(other), stopping, freed: Boolean(await start("a", limit + 1)) };
+}

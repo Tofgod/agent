@@ -276,7 +276,7 @@ test("Seedance 2.0, 2.5 and MiniMax H3 variants send their own endpoint and para
     assert.equal(result.model, model); assert.equal(result.taskId, model.startsWith("doubao") ? "ark-task" : "minimax-task");
   }
   for (const [model, duration] of [["MiniMax-H3-Max", 4], ["MiniMax-H3", 16], ["doubao-seedance-2-0-260128", 16], ["doubao-seedance-2-5-260628", 31]] as const) {
-    await assert.rejects(submitVideo({ ...providerConfig, videoModel: model }, "test", "image", "16:9", duration), /要求单镜头/);
+    await assert.rejects(submitVideo({ ...providerConfig, videoModel: model }, "test", "image", "16:9", duration), { code: "DURATION_UNSUPPORTED" });
   }
   assert.equal(count, 4);
   assert.deepEqual(videoDurationLimits("doubao-seedance-2-0-260128"), { min: 4, max: 15 });
@@ -315,7 +315,7 @@ test("AI Club Seedance sends each gateway model ID, frame roles and multimodal i
   await assert.rejects(submitVideo(standard, "", { audio: ["audio"] }, "16:9", 5), /搭配参考图片或视频/);
   await assert.rejects(submitVideo(standard, "shot", { last: "last" }, "16:9", 5), /同时指定首帧/);
   await assert.rejects(submitVideo(standard, "", { first: "first", images: ["image"] }, "16:9", 5), /分别提交/);
-  await assert.rejects(submitVideo(standard, "shot", {}, "16:9", 16), /要求单镜头/);
+  await assert.rejects(submitVideo(standard, "shot", {}, "16:9", 16), { code: "DURATION_UNSUPPORTED" });
   assert.equal(bodies.length, 5);
 });
 test("Ark and AI Club use identical Seedance payloads apart from model IDs", async (t) => {
@@ -354,8 +354,64 @@ test("Ark and AI Club use identical Seedance payloads apart from model IDs", asy
   await assert.rejects(submitVideo({ ...providerConfig, videoModel: "zimao-2.0-fast" }, "shot", {}, "9:16", 6, false, { resolution: "4k" }), /可用分辨率/);
   await assert.rejects(submitVideo({ ...providerConfig, videoModel: "zimao-2.5" }, "shot", { videos: ["video"] }, "1:1", -1, false,
     { omni_reference_task_type: "edit" }), /ratio.*adaptive/);
+  await assert.rejects(submitVideo({ ...providerConfig, videoModel: "zimao-2.5" }, "shot", { videos: ["video"] }, "adaptive", 30, false,
+    { omni_reference_task_type: "edit" }), /duration.*-1/);
   assert.equal(bodies.length, count);
 });
+
+test("the model-facing video duration matches the queued model and submitted duration for all configured routes", async (t) => {
+  const routes = [
+    { model: "doubao-seedance-2-5-260628", min: 4, max: 30, auto: true, path: "/contents/generations/tasks" },
+    { model: "zimao-2.5", min: 4, max: 30, auto: true, path: "/openApi/doubao/v1/video" },
+    { model: "doubao-seedance-2-0-260128", min: 4, max: 15, auto: true, path: "/contents/generations/tasks" },
+    { model: "zimao-2.0", min: 4, max: 15, auto: true, path: "/openApi/doubao/v1/video" },
+    { model: "zimao-2.0-fast", min: 4, max: 15, auto: true, path: "/openApi/doubao/v1/video" },
+    { model: "MiniMax-H3", min: 4, max: 15, auto: false, path: "/v2/video_generation" },
+    { model: "MiniMax-H3-Max", min: 5, max: 15, auto: false, path: "/v2/video_generation" },
+  ] as const;
+  assert.deepEqual(routes.map(({ model }) => model).sort(), [...VIDEO_MODELS].sort());
+  for (const { model, min, max, auto, path } of routes) await t.test(model, async (t) => {
+    const { store, p, run } = await agentFixture("生成单段 " + max + " 秒视频");
+    const settings = { ...providerConfig, videoModel: model };
+    const requestBodies: Record<string, unknown>[] = [];
+    const bucket: BlobStore = { get: async () => null, put: async () => {} };
+    t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+      assert.ok(url.endsWith(path));
+      assert.equal(init.method, "POST");
+      requestBodies.push(JSON.parse(String(init.body)));
+      return Response.json(auto ? { id: "duration-fixture" } : { task_id: "duration-fixture" });
+    });
+    const isMax = model === "MiniMax-H3-Max";
+    const extra = isMax ? { prompt_expansion_mode: "quality" } : undefined;
+    await advanceRun(store, p, run.id, settings, bucket, async (_system, messages, tools) => {
+      const schema = tools.find(({ function: fn }) => fn.name === "generate_video")!.function;
+      assert.ok(schema.description.includes(`${model} 提交后台生成，单次支持 ${min}–${max} 秒`));
+      const properties = schema.parameters.properties as Record<string, Record<string, unknown>>;
+      const { description: _description, ...durationSchema } = properties.duration;
+      const range = { minimum: min, maximum: max };
+      assert.deepEqual(durationSchema, { type: "integer", ...(auto ? { anyOf: [{ const: -1 }, range] } : range) });
+      assert.equal(Boolean(properties.extra), isMax);
+      const context = messages.findLast(({ source }) => source?.kind === "runtime-context")?.source;
+      assert.ok(context?.kind === "runtime-context");
+      assert.deepEqual(JSON.parse(context.sections.find(({ name }) => name === "capabilities")!.text).videoGeneration,
+        { model, singleRequestDurationSeconds: { min, max } });
+      return call("max-duration", "generate_video", { file_path: "/04_视频/单段.mp4", prompt: "A single shot.", duration: max,
+        ...(extra ? { extra, reference_videos: [{ type: "url", url: "https://assets.example.test/reference.mp4" }] } : {}) });
+    });
+    await advanceRun(store, p, run.id, settings, bucket, async () => assert.fail("The accepted tool batch must settle first"));
+    const [job] = await store.children(run);
+    assert.equal(job?.payload.operation?.duration, max);
+    await advanceRun(store, p, job.id, settings, bucket);
+    assert.equal(requestBodies.length, 1);
+    assert.equal(requestBodies[0].model, model);
+    assert.equal(requestBodies[0].duration, max);
+    assert.deepEqual(requestBodies[0].extra, extra);
+    assert.equal(requestBodies[0].ratio, isMax ? "adaptive" : p.ratio);
+    await assert.rejects(submitVideo(settings, "test", {}, "16:9", max + 1), { code: "DURATION_UNSUPPORTED" });
+    assert.equal(requestBodies.length, 1);
+  });
+});
+
 test("MiniMax and Seedream submit model-specific size, ratio and audio choices", async (t) => {
   const bodies: Record<string, unknown>[] = [];
   t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {

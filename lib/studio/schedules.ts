@@ -77,6 +77,17 @@ const deliveryInProgress = (
     OR EXISTS(SELECT 1 FROM chat_queue q WHERE q.project_id=${project} AND q.session_id=${destination} AND q.status='pending')
   ))
 )`;
+const eligibleScheduleTimes = `WITH candidates AS (
+  SELECT s.*,s.rowid AS registration_order,json_extract(s.data,'$.target.kind') AS target,
+    json_extract(s.last,'$.requestId') AS request_id,json_extract(s.last,'$.scheduledFor') AS occurrence,
+    json_extract(s.last,'$.at') AS delivered,CASE WHEN json_extract(s.data,'$.target.kind')='new' THEN ? ELSE ? END AS spacing
+  FROM studio_schedules s JOIN projects p ON p.id=s.project_id
+  WHERE s.status='active' AND s.next_at IS NOT NULL AND p.status<>'archived' AND ${sessionActive("s.project_id", "s.session_id")}
+), eligible AS (
+  SELECT s.*,MAX(s.next_at,COALESCE((CASE WHEN s.next_at-s.occurrence>=s.spacing THEN s.occurrence ELSE s.delivered END)+s.spacing,s.next_at)) AS due_at
+  FROM candidates s WHERE s.target='new' OR s.request_id IS NULL OR NOT ${deliveryInProgress("s.project_id", "s.request_id",
+    "json_extract(s.last,'$.sessionId')", "json_extract(s.last,'$.slotReleased')")}
+)`;
 
 export class Schedules {
   private readonly policy;
@@ -217,19 +228,14 @@ export class Schedules {
       SELECT 1 FROM receipt s WHERE ${deliveryInProgress("s.project_id", "s.request_id", "s.session_id", "s.released")}`)
       .bind(task.projectId, requestId, task.last!.sessionId, task.last!.slotReleased === undefined ? null : Number(task.last!.slotReleased)).rows().length > 0;
   }
+  nextWakeAt() {
+    const [next] = this.db.prepare(eligibleScheduleTimes + " SELECT MIN(due_at) AS at FROM eligible")
+      .bind(this.policy.newSessionIntervalSeconds * 1000, minSpacing).rows<{ at: number | null }>();
+    return next.at;
+  }
   async runDue(at = Date.now()) {
-    const due = this.db.prepare(`WITH candidates AS (
-      SELECT s.*,s.rowid AS registration_order,json_extract(s.data,'$.target.kind') AS target,json_extract(s.last,'$.requestId') AS request_id,
-        json_extract(s.last,'$.scheduledFor') AS occurrence, json_extract(s.last,'$.at') AS delivered,
-        CASE WHEN json_extract(s.data,'$.target.kind')='new' THEN ? ELSE ? END AS spacing
-      FROM studio_schedules s JOIN projects p ON p.id=s.project_id
-      WHERE s.status='active' AND s.next_at<=? AND p.status<>'archived' AND ${sessionActive("s.project_id", "s.session_id")}
-    )
-    SELECT s.* FROM candidates s
-    WHERE (s.delivered IS NULL OR (CASE WHEN s.next_at-s.occurrence>=s.spacing THEN s.occurrence ELSE s.delivered END)+s.spacing<=?)
-      AND (s.target='new' OR s.request_id IS NULL OR NOT ${deliveryInProgress("s.project_id", "s.request_id",
-        "json_extract(s.last,'$.sessionId')", "json_extract(s.last,'$.slotReleased')")})
-    ORDER BY s.registration_order`).bind(this.policy.newSessionIntervalSeconds * 1000, minSpacing, at, at).rows<Row>();
+    const due = this.db.prepare(eligibleScheduleTimes + " SELECT * FROM eligible WHERE due_at<=? ORDER BY registration_order")
+      .bind(this.policy.newSessionIntervalSeconds * 1000, minSpacing, at).rows<Row>();
     type Due = { task: ScheduleRecord; occurrence: Occurrence };
     const batches = new Map<string, Due[]>();
     const deliveries: Due[][] = [];

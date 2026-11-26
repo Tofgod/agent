@@ -60,6 +60,11 @@ export const scheduleTitle = "Before the edit";
 export const scheduleTitleAfter = "After the edit";
 export const schedulePrompt = "Check the related conversation.";
 export const scheduleTimingFixture = { kind: "rrule", rrule: "DTSTART:20990101T000000Z\nRRULE:FREQ=DAILY;COUNT=1" };
+export const scheduleWakeProbe = {
+  name: "schedule runtime wakes for a newly registered earlier deadline",
+  earlier: { prompt: "earlier deadline", ms: 350 },
+  later: { prompt: "later deadline", ms: 10_000 },
+};
 export const hooksQuery = "Run the audit tools";
 export const hookResult = "converted result";
 export const streamOutput = Array.from({ length: 48 }, (_, i) => "part-" + (i + 1));
@@ -69,7 +74,75 @@ export const oversizedOutput = "界".repeat(100_000) + outputTail;
 export const skillGesture = "/shared-skill";
 export const sharedSkillBody = "Use the matching resource only when needed.";
 export const largeSkillBody = "x".repeat(132 * 1024);
-export const normalizeSkillBlock = (content) => content.replace(/Base directory for this skill: [^\n]+/g, "Base directory for this skill: <fixture>");
+// Local skill resources have different read tools on the two hosts.
+export const normalizeSkillBlock = (content) => content.replace(/<skill_resources>\n[\s\S]*?\n<\/skill_resources>/g, "<skill_resources>\n<fixture>\n</skill_resources>");
+export const skillLookupPrompt = "Load the skill through the model tool.";
+export const skillCatalogProbe = {
+  name: "Skills keep an independent catalog and load only the selected instructions",
+  skill: "catalog-probe",
+  manual: "manual-probe",
+  description: "Check the project guide",
+  renamed: "Check the revised guide",
+  original: "First body kept outside the catalog",
+  edited: "Edited body read on demand",
+  direct: "Body loaded by the user",
+  manualBody: "Manual-only instructions",
+  phases: [
+    { id: "initial-empty" },
+    { id: "added", installed: true },
+    { id: "unrelated-update", installed: true },
+    { id: "read-edited-body", installed: true, action: "load" },
+    { id: "incomplete", installed: true, complete: false },
+    { id: "still-incomplete", installed: true, complete: false },
+    { id: "recovered", installed: true },
+    { id: "description-changed", installed: true, renamed: true },
+    { id: "user-invocation", installed: true, renamed: true, action: "direct" },
+    { id: "rejected-input", installed: true, renamed: true, action: "veto" },
+    { id: "removed" },
+    { id: "manual-invocation", action: "manual" },
+  ],
+};
+
+export function observeSkillCatalog(sources) {
+  const history = sources.filter((source) => source?.kind === "skill-catalog");
+  const latest = history.at(-1);
+  return { revisions: history.length, entries: latest?.entries?.map(({ name, description }) => [name, description]) ?? [],
+    incomplete: latest?.incomplete === true, update: latest?.update === true };
+}
+
+export function skillPhasePrompt(probe, phase) {
+  if (phase.action === "direct" || phase.action === "veto") return "/" + probe.skill + " /" + probe.skill + " " + phase.id;
+  if (phase.action === "manual") return "/" + probe.manual + " " + phase.id;
+  return phase.id;
+}
+export const skillLifecycle = {
+  name: "Skills use the current preset and catalog through compaction and cold resume",
+  shared: "lifecycle-skill", firstOnly: "first-only", secondOnly: "second-only",
+  before: "BODY_FROM_FIRST_PRESET", after: "BODY_FROM_SECOND_PRESET", refreshed: "BODY_AFTER_RESTART",
+  initial: "Review the restored skill catalog", invocation: "/lifecycle-skill /lifecycle-skill",
+  older: "Earlier project context. ".repeat(240), recent: "Keep the recent requirement.",
+  summary: "The earlier project context was condensed.",
+};
+export function observeSkillLifecycle(sources, bodyBlocks, reads) {
+  return { ...observeSkillCatalog(sources), blocks: bodyBlocks.flatMap((block) =>
+    [skillLifecycle.before, skillLifecycle.after, skillLifecycle.refreshed].filter((marker) => block.includes(marker))), reads };
+}
+export const skillStepProbe = {
+  name: "Skills use the claimed input, refresh between steps and keep model retries frozen",
+  skill: "step-skill", body: "Instructions for the current step.",
+  phases: [
+    { id: "removed-gesture", input: "/step-skill remove", text: "Proceed without a skill." },
+    { id: "added-gesture", input: "Add a skill", text: "/step-skill" },
+    { id: "external-gesture", input: "Inject external context", text: "/step-skill", external: true },
+    { id: "provider-updated-in-admission", input: "Inspect skill catalog", admittedDescription: "Updated by the admission callback" },
+    { id: "provider-updated-between-steps", input: "Inspect files", nextDescription: "Updated after the request", tool: true },
+    { id: "frozen-provider-retry", input: "/step-skill", nextDescription: "Updated while retrying the request", retry: true },
+    { id: "after-retry", input: "Inspect the latest catalog" },
+  ],
+};
+export function observeSkillStep(sources, reads) {
+  return { ...observeSkillCatalog(sources), blocks: sources.filter((source) => source?.kind === "skill-invocation").length, reads };
+}
 export const mcpConcurrentRefresh = `
 const input = require('node:readline').createInterface({ input: process.stdin });
 const send = (message) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\\n');

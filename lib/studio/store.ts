@@ -4,7 +4,7 @@ import { mergeSettings, savedSettings } from "./settings";
 import { videoTaskOutput, type MediaResult, type MediaTask } from "./providers";
 import { compositionOutput } from "./media-specs";
 import { productionFinished } from "./agent-state";
-import { agentIdentity, leadAgentId } from "./agent-identity";
+import { agentIdentity, joinMemberPath, leadAgentId, memberAddresses } from "./agent-identity";
 import { AppError, decryptSecrets, encryptSecrets } from "./security";
 import { webReceiptSources } from "./web-tools";
 import { PROJECT_MEMORY, PROJECT_TRASH, projectOutputPath, projectTrashPath } from "./project-layout";
@@ -48,11 +48,19 @@ const currentAgent = (alias: string) => `json_extract(${alias}.payload,'$.inheri
 export const sessionActive = (project: string, session: string) => `NOT EXISTS(SELECT 1 FROM session_management sm
   WHERE sm.project_id=${project} AND sm.session_id=${session} AND sm.archived=1)`;
 export const activeRunStatus = "status IN ('queued','running','waiting')";
-export const cancelledRunPayload = `json_set(payload,'$.cancellation',CASE
+export const cancelledRunPayload = `json_remove(json_set(payload,'$.cancellation',CASE
   WHEN json_extract(payload,'$.providerTaskId') IS NOT NULL THEN json('{"state":"checking","detail":"本地已停止，正在核对供应商状态","attempts":0}')
   WHEN json_extract(payload,'$.submissionUnknown')=1 THEN json('{"state":"unknown","detail":"本地已停止，提交结果尚未确认","attempts":0}')
-  ELSE NULL END)`;
+  ELSE NULL END),'$.agentInterrupted')`;
 const creativeChild = (alias: string) => `${alias}.parent_run_id IS NOT NULL AND ${alias}.agent_role<>'media' AND ${currentAgent(alias)}`;
+// Every turn of the lead shares one identity. A delegated agent keeps its own run id across turns.
+const madeByAgent = (task: string, ownerId: string) => `EXISTS(
+  SELECT 1 FROM runs creator JOIN runs actor ON actor.id=${ownerId}
+  WHERE creator.id=${task}.parent_run_id AND creator.project_id=actor.project_id AND creator.session_id=actor.session_id
+    AND ${currentAgent("creator")} AND (creator.id=actor.id OR (creator.parent_run_id IS NULL AND actor.parent_run_id IS NULL)))`;
+const ownerJobs = (ownerId: string, except = "NULL") => `SELECT COUNT(*) AS count FROM runs job WHERE job.project_id=? AND job.session_id=?
+  AND job.id IS NOT ${except} AND job.background=1 AND ${currentAgent("job")} AND ${madeByAgent("job", ownerId)}
+  AND (job.${activeRunStatus} OR (job.status IN ('paused','cancelled') AND job.lease_until>CAST(unixepoch('subsec')*1000 AS INTEGER)))`;
 const toolCallerGuard = `EXISTS(SELECT 1 FROM runs WHERE id=? AND project_id=? AND lease_token=? AND input_version=? AND status='running')
   AND NOT EXISTS(SELECT 1 FROM tool_receipts WHERE run_id=? AND call_id=?)`;
 const sealedStructuredResult = (runId: string) => `SELECT 1 FROM tool_receipts t JOIN execution_steps e ON e.run_id=t.run_id AND e.call_id=t.call_id
@@ -86,7 +94,7 @@ const unclaimedTaskResults = (wakeBackground: boolean) => `FROM agent_inbox i JO
     AND ((child.background=0 AND child.agent_role<>'media' AND parent.parent_run_id IS NULL AND parent.status='done' AND parent.intent='agent'
       AND NOT EXISTS(SELECT 1 FROM runs received WHERE received.project_id=i.project_id AND received.session_id=i.session_id
         AND received.parent_run_id IS NULL AND json_extract(received.payload,'$.agent.childNotices."'||child.id||'"')=${taskNoticeToken("child")}))${wakeBackground ? `
-      OR (child.background=1 AND COALESCE(json_extract(child.payload,'$.cancellation.state'),'') NOT IN ('checking','running','unknown')
+      OR (child.background=1 AND parent.parent_run_id IS NULL AND COALESCE(json_extract(child.payload,'$.cancellation.state'),'') NOT IN ('checking','running','unknown')
         AND NOT EXISTS(SELECT 1 FROM runs received WHERE received.project_id=i.project_id AND received.session_id=i.session_id
           AND received.parent_run_id IS NULL AND json_extract(received.payload,'$.agent.backgroundNotices."'||child.id||'"')=${taskNoticeToken("child")}))` : ""})`;
 // Recheck the selected tasks at claim time, including when a job settles before its waiter parks.
@@ -98,7 +106,8 @@ const agentWaitBlocked = `(runs.status='waiting'
     AND i.id NOT IN (SELECT value FROM json_each(runs.payload,'$.agent.seenUserIds')))
   AND NOT EXISTS(SELECT 1 FROM runs notice WHERE notice.project_id=runs.project_id AND notice.session_id=runs.session_id
     AND ${currentAgent("notice")}
-    AND (notice.parent_run_id=runs.id OR (runs.parent_run_id IS NULL AND notice.background=1) OR ${routedChildResult("notice", "runs")})
+    AND ((notice.background=1 AND ${madeByAgent("notice", "runs.id")})
+      OR (notice.background=0 AND (notice.parent_run_id=runs.id OR ${routedChildResult("notice", "runs")})))
     AND notice.status IN ('done','failed','cancelled','paused')
     AND notice.id NOT IN (SELECT value FROM json_each(runs.payload,'$.agent.waitingFor'))
     AND COALESCE(json_extract(runs.payload,CASE WHEN notice.background=1 THEN '$.agent.backgroundNotices' ELSE '$.agent.childNotices' END
@@ -107,7 +116,8 @@ const agentWaitBlocked = `(runs.status='waiting'
     OR ((json_extract(runs.payload,'$.agent.waitingForTasksUntil') IS NULL
       OR json_extract(runs.payload,'$.agent.waitingForTasksUntil')>CAST(unixepoch('subsec')*1000 AS INTEGER))
       AND EXISTS(SELECT 1 FROM json_each(runs.payload,'$.agent.waitingFor') awaited JOIN runs task ON task.id=awaited.value
-        WHERE task.project_id=runs.project_id AND task.session_id=runs.session_id AND task.status IN ('queued','running','waiting')))))`;
+        WHERE task.project_id=runs.project_id AND task.session_id=runs.session_id AND task.status IN ('queued','running','waiting')
+          AND (task.background=0 OR ${madeByAgent("task", "runs.id")})))))`;
 export type ToolCaller = { run: Run; callId: string };
 export type SkippedToolCall = { call: AgentToolCall; index: number; requestId?: string };
 const toolCallerBindings = (projectId: string, { run, callId }: ToolCaller) =>
@@ -121,13 +131,14 @@ const json = (v: unknown) => JSON.stringify(v);
 function allocateMemberName(used: Set<string>, requested?: string) {
   if (requested !== undefined && (!/^[a-z][a-z0-9-]{0,31}$/.test(requested) || requested === "lead"))
     throw new AppError("子智能体名称无效", 400, "INVALID_AGENT_NAME");
-  if (requested && used.has(requested)) throw new AppError("同一对话已有此智能体名称", 409, "DUPLICATE_AGENT_NAME");
+  if (requested && used.has(requested)) throw duplicateAgentName();
   let number = 1;
   while (!requested && used.has("agent-" + number)) number++;
   const name = requested ?? "agent-" + number;
   used.add(name);
   return name;
 }
+const duplicateAgentName = () => new AppError("当前智能体已创建同名子智能体", 409, "DUPLICATE_AGENT_NAME");
 function validateDependencies(entries: { id: string; dependencies: string[] }[]) {
   const graph = new Map(entries.map(({ id, dependencies }) => [id, dependencies]));
   const visiting = new Set<string>(), visited = new Set<string>();
@@ -202,16 +213,20 @@ export class Store {
   readonly maxParallelTools: number;
   readonly maxDelegationDepth: number;
   readonly maxConsecutiveWakes?: number;
+  readonly maxConcurrentJobsPerOwner: number;
   readonly jobWaitTimeout: number;
   readonly maxJobWaitTimeout: number;
   constructor(public db: Database, options: { agents?: readonly AgentDefinition[]; contextWindow?: number; tools?: readonly ToolRegistration[]; compaction?: CompactionConfig;
     resolveModel?: TextModelResolver; modelRetry?: ModelRetryConfig;
     skills?: SkillLibrary; mcp?: McpManager; presetPlugins?: PresetPlugins; scheduleToolsEnabled?: boolean; schedulePolicy?: SchedulePolicy;
-    completionDelivery?: "quiet" | "wakeup"; maxParallelTools?: number; maxDelegationDepth?: number; maxConsecutiveWakes?: number; jobWaitTimeout?: number; maxJobWaitTimeout?: number } = {}) {
+    completionDelivery?: "quiet" | "wakeup"; maxParallelTools?: number; maxDelegationDepth?: number; maxConsecutiveWakes?: number; maxConcurrentJobsPerOwner?: number; jobWaitTimeout?: number; maxJobWaitTimeout?: number } = {}) {
     this.completionDelivery = options.completionDelivery ?? "wakeup";
     this.maxParallelTools = options.maxParallelTools ?? 10;
     this.maxDelegationDepth = options.maxDelegationDepth ?? 1;
     this.maxConsecutiveWakes = options.maxConsecutiveWakes;
+    this.maxConcurrentJobsPerOwner = options.maxConcurrentJobsPerOwner ?? 10;
+    if (!Number.isSafeInteger(this.maxConcurrentJobsPerOwner) || this.maxConcurrentJobsPerOwner < 1)
+      throw new TypeError("每个智能体的后台任务上限必须是正整数");
     this.jobWaitTimeout = options.jobWaitTimeout ?? 30_000;
     this.maxJobWaitTimeout = options.maxJobWaitTimeout ?? 600_000;
     if (!Number.isSafeInteger(this.jobWaitTimeout) || !Number.isSafeInteger(this.maxJobWaitTimeout) ||
@@ -755,7 +770,7 @@ export class Store {
       if (args && typeof args === "object" && !Array.isArray(args)) input = args;
     } catch {}
     const queries = Array.isArray(input.queries) && input.queries.every((query) => typeof query === "string") ? input.queries.join(" · ") : undefined;
-    const summary = [input.file_path, input.directory, input.query, queries, input.url, input.title, input.role, input.name].find((value) => typeof value === "string") as string | undefined;
+    const summary = [input.file_path, call.function.name === "skill" ? input.resource : undefined, input.directory, input.query, queries, input.url, input.title, input.role, input.name].find((value) => typeof value === "string") as string | undefined;
     await this.db.batch([
       this.db.prepare("INSERT OR IGNORE INTO execution_steps(project_id,run_id,call_id,name,status,arguments,summary,started_at,request_id,call_index,provider_call_id) SELECT ?,?,?,?,'running',?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM runs WHERE id=? AND lease_token=? AND input_version=? AND status='running')")
         .bind(run.projectId, run.id, call.id, call.function.name, call.function.arguments, Array.from(summary || "").slice(0, 300).join(""), now(),
@@ -935,9 +950,12 @@ export class Store {
   async readAgentToolResult(run: Run, target: { reference?: string; runId: string; seq?: number }, offset: number, imageIndex?: number) {
     const [row] = this.db.prepare(`SELECT s.seq,s.run_id,s.output_ref,s.output_images,
       r.parent_run_id IS NULL AND r.agent_role='main' AND ${currentAgent("r")} AS session_lead FROM execution_steps s JOIN runs r ON r.id=s.run_id
-      WHERE s.project_id=? AND r.session_id=? AND s.finished_at IS NOT NULL AND
+      WHERE s.project_id=? AND r.session_id=? AND s.finished_at IS NOT NULL
+        AND (s.name<>'job_output' OR EXISTS(SELECT 1 FROM runs viewer WHERE viewer.id=?
+          AND ${currentAgent("r")} AND (viewer.id=r.id OR (viewer.parent_run_id IS NULL AND r.parent_run_id IS NULL))))
+        AND
         ${target.reference ? "s.output_ref=?" : "s.run_id=? AND s.seq=?"} ORDER BY s.seq LIMIT 1`)
-      .bind(run.projectId, run.sessionId ?? "", ...(target.reference ? [target.reference] : [target.runId, target.seq]))
+      .bind(run.projectId, run.sessionId ?? "", run.id, ...(target.reference ? [target.reference] : [target.runId, target.seq]))
       .rows<{ seq: number; run_id: string; output_ref: string | null; output_images: string | null; session_lead: number }>();
     const seeded = target.reference && run.payload.agent?.messages.some((message) => message.outputRef === target.reference);
     if (!row || (run.parentRunId && row.run_id !== run.id && !row.session_lead && !seeded && !(await this.collaborators(run)).some((item) => item.id === row.run_id)))
@@ -956,8 +974,9 @@ export class Store {
       UNION ALL SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id=t.id)`;
     return this.db.prepare(`${scoped ? "" : tree} SELECT s.seq,s.run_id AS task_id,s.name,s.status,s.summary,s.output_ref AS result_ref
       FROM execution_steps s JOIN runs r ON r.id=s.run_id WHERE s.project_id=? AND r.session_id=? AND s.seq<?
+      AND (s.name<>'job_output' OR (r.id=? OR (? AND r.parent_run_id IS NULL)))
       ${scoped ? "" : "AND s.run_id IN (SELECT id FROM tree)"} ORDER BY s.seq DESC LIMIT 20`)
-      .bind(...(scoped ? [] : [run.id, run.projectId]), run.projectId, run.sessionId ?? "", before)
+      .bind(...(scoped ? [] : [run.id, run.projectId]), run.projectId, run.sessionId ?? "", before, run.id, run.parentRunId ? 0 : 1)
       .rows<{ seq: number; task_id: string; name: string; status: string; summary: string; result_ref: string | null }>();
   }
   private readExecutionHistory(projectId: string, runId: string | undefined, before: number, limit: number, anchors?: ReturnType<typeof projectConversation>) {
@@ -1002,10 +1021,28 @@ export class Store {
   async agentTasks(run: Run) {
     const rows = await this.db.prepare(`SELECT task.* FROM runs task JOIN runs owner ON owner.id=?
       WHERE task.project_id=owner.project_id AND task.session_id=owner.session_id AND ${currentAgent("task")}
-      AND (task.parent_run_id=owner.id OR (owner.parent_run_id IS NULL AND (task.background=1 OR (${creativeChild("task")})))
-        OR ${routedChildResult("task", "owner")})
+      AND ((task.background=1 AND ${madeByAgent("task", "owner.id")})
+        OR (task.background=0 AND (task.parent_run_id=owner.id OR (owner.parent_run_id IS NULL AND ${creativeChild("task")})
+          OR ${routedChildResult("task", "owner")})))
       ORDER BY task.created_at,task.id`).bind(run.id).all<Row>();
     return rows.results.map((row) => this.restoreRun(row));
+  }
+  async ownedBackgroundJob(run: Run, jobId: string) {
+    const row = await this.db.prepare(`SELECT j.*, ${madeByAgent("j", "?")} AS owned FROM runs j
+      WHERE j.id=? AND j.project_id=? AND j.session_id=? AND j.background=1 AND ${currentAgent("j")}`)
+      .bind(run.id, jobId, run.projectId, run.sessionId ?? "").first<Row>();
+    if (!row) throw new AppError("后台任务不存在", 404, "JOB_NOT_FOUND");
+    if (!row.owned) throw new AppError("后台任务属于其他智能体", 403, "JOB_FOREIGN_SESSION");
+    return this.restoreRun(row);
+  }
+  async assertTaskControl(run: Run, target: Run) {
+    if (target.background) { await this.ownedBackgroundJob(run, target.id); return; }
+    const descendants = this.db.prepare(`WITH RECURSIVE descendants(id) AS (
+      SELECT r.id FROM runs r WHERE r.project_id=? AND r.session_id=? AND ${creativeChild("r")} AND ${madeByAgent("r", "?")}
+      UNION ALL SELECT r.id FROM runs r JOIN descendants p ON p.id=r.parent_run_id
+        WHERE r.project_id=? AND r.session_id=? AND ${creativeChild("r")}
+    ) SELECT 1 FROM descendants WHERE id=?`).bind(run.projectId, run.sessionId ?? "", run.id, run.projectId, run.sessionId ?? "", target.id).rows();
+    if (!descendants.length) throw new AppError("只能控制自己委派的子智能体或后代", 403, "TASK_NOT_REACHABLE");
   }
   async previousAgent(run: Pick<Run, "projectId" | "id" | "agentRole" | "sessionId">, completedOnly = false) {
     const row = await this.db.prepare(`SELECT * FROM runs
@@ -1064,36 +1101,53 @@ export class Store {
       .bind(target, run.projectId, run.sessionId ?? "").rows().length) return lead;
     const explicit = members.find((member) => member.id === target);
     if (explicit) return explicit;
-    const named = members.filter((member) => member.payload.memberName === target);
+    const addresses = memberAddresses(members);
+    const named = members.filter((member) => addresses.get(member.id) === target);
     if (named.length > 1) throw new AppError("旧记录中有多个同名智能体，请使用任务编号", 409, "AMBIGUOUS_AGENT_NAME");
+    if (!named.length && target.includes("/")) throw new AppError("找不到该智能体路径", 404, "AGENT_NAME_NOT_FOUND");
     return named[0];
   }
   private memberNames(parent: Run) {
-    return new Set(this.db.prepare(`SELECT json_extract(payload,'$.memberName') AS name FROM runs r WHERE project_id=? AND session_id=? AND ${creativeChild("r")}`)
-      .bind(parent.projectId, parent.sessionId ?? "").rows<{ name: string | null }>().flatMap(({ name }) => name ? [name] : []));
+    return new Set(this.db.prepare(`SELECT json_extract(payload,'$.memberName') AS name FROM runs r WHERE project_id=? AND session_id=?
+      AND ${creativeChild("r")} AND ${madeByAgent("r", "?")}`)
+      .bind(parent.projectId, parent.sessionId ?? "", parent.id).rows<{ name: string | null }>().flatMap(({ name }) => name ? [name] : []));
+  }
+  private jobLimitReached(projectId: string, sessionId: string, ownerId: string, excludeId?: string) {
+    const [active] = this.db.prepare(ownerJobs("?", "?")).bind(projectId, sessionId, excludeId ?? null, ownerId).rows<{ count: number }>();
+    return active.count >= this.maxConcurrentJobsPerOwner;
+  }
+  private jobLimitError() {
+    return new AppError(`当前智能体已有 ${this.maxConcurrentJobsPerOwner} 个进行中的后台任务，请等待任务结束或停止后再试`, 409, "JOB_LIMIT_REACHED");
   }
   async sendAgentMessage(sender: Run, callId: string, targetId: string, content: string) {
     const cached = await this.toolResult(sender.id, callId); if (cached) return cached;
     const target = await this.resolveCollaborator(sender, targetId);
     if (!target || agentIdentity(target) === agentIdentity(sender))
       throw new AppError("只能向当前协作会话中的其他创作智能体发送消息", 403, "AGENT_NOT_REACHABLE");
-    if (!target.parentRunId) return this.sendToLead(sender, callId, content);
+    const senderName = sender.parentRunId ? memberAddresses(await this.collaborators(sender)).get(sender.id) ?? sender.id : leadAgentId;
+    const source = json({ kind: "agent-message", senderRunId: sender.id, senderRole: sender.agentRole, senderName } satisfies AgentInputSource);
+    if (!target.parentRunId) return this.sendToLead(sender, callId, content, source);
     if (target.payload.childExecution?.outputSchema && this.db.prepare(sealedStructuredResult("?")).bind(target.id).rows().length)
       throw new AppError("对方已提交结构化结果，本次委派已结束", 409, "INPUT_CLOSED");
-    if (["paused", "cancelled"].includes(target.status)) throw new AppError("对方任务已暂停或取消，请先继续任务", 409, "AGENT_STOPPED");
+    if (target.status === "paused" || (target.status === "cancelled" && !target.payload.agentInterrupted))
+      throw new AppError("对方任务已暂停或取消，请先继续任务", 409, "AGENT_STOPPED");
+    const settled = "status IN ('done','failed','cancelled')";
     const messageId = uid(), t = now(), result = { message_id: messageId, task_id: target.id, agent_id: agentIdentity(target) };
     const results = await this.db.batch([
-      this.db.prepare(`UPDATE runs SET generation=generation+CASE WHEN status IN ('done','failed') THEN 1 ELSE 0 END,
-        status=CASE WHEN status IN ('done','failed') THEN 'queued' ELSE status END,stage='agent',
-        next_attempt_at=CASE WHEN status IN ('done','failed') OR json_extract(payload,'$.agent.waitingInputVersion') IS NOT NULL THEN 0 ELSE next_attempt_at END,
-        error=CASE WHEN status IN ('done','failed') THEN NULL ELSE error END,
-        error_code=CASE WHEN status IN ('done','failed') THEN NULL ELSE error_code END,
-        attempts=CASE WHEN status IN ('done','failed') THEN 0 ELSE attempts END,result_text='',updated_at=?
-        WHERE id=? AND project_id=? AND status NOT IN ('paused','cancelled') AND (status NOT IN ('done','failed') OR NOT ${unfinishedAgentExecution})
+      this.db.prepare(`UPDATE runs SET generation=generation+CASE WHEN ${settled} THEN 1 ELSE 0 END,
+        status=CASE WHEN ${settled} THEN 'queued' ELSE status END,stage='agent',
+        next_attempt_at=CASE WHEN ${settled} OR json_extract(payload,'$.agent.waitingInputVersion') IS NOT NULL THEN 0 ELSE next_attempt_at END,
+        error=CASE WHEN ${settled} THEN NULL ELSE error END,
+        error_code=CASE WHEN ${settled} THEN NULL ELSE error_code END,
+        attempts=CASE WHEN ${settled} THEN 0 ELSE attempts END, result_text='', updated_at=?,
+        payload=CASE WHEN status='cancelled' THEN json_remove(payload,'$.agentInterrupted','$.cancellation') ELSE payload END
+        WHERE id=? AND project_id=? AND status<>'paused'
+        AND (status<>'cancelled' OR (json_extract(payload,'$.agentInterrupted')=1 AND lease_until<=?))
+        AND (NOT (${settled}) OR NOT ${unfinishedAgentExecution})
         AND NOT EXISTS(${sealedStructuredResult("runs.id")}) AND ${toolCallerGuard}`)
-        .bind(t, target.id, sender.projectId, ...toolCallerBindings(sender.projectId, { run: sender, callId })),
+        .bind(t, target.id, sender.projectId, Date.now(), ...toolCallerBindings(sender.projectId, { run: sender, callId })),
       this.db.prepare("INSERT INTO agent_inputs(id,run_id,content,created_at,source) SELECT ?,?,?,?,? WHERE changes()=1")
-        .bind(messageId, target.id, content, t, json({ kind: "agent-message", senderRunId: sender.id, senderRole: sender.agentRole } satisfies AgentInputSource)),
+        .bind(messageId, target.id, content, t, source),
       this.db.prepare("INSERT INTO tool_receipts(run_id,call_id,result,created_at) SELECT ?,?,?,? WHERE changes()=1").bind(sender.id, callId, json(result), t),
       this.db.prepare("INSERT INTO events(project_id,type,data,created_at) SELECT ?,'run',?,? WHERE changes()=1").bind(sender.projectId, json(result), t),
     ]);
@@ -1108,11 +1162,10 @@ export class Store {
     notifyExecutions(this.db, sender.projectId);
     return result;
   }
-  private async sendToLead(sender: Run, callId: string, content: string) {
+  private async sendToLead(sender: Run, callId: string, content: string, source: string) {
     const scope = [sender.projectId, sender.sessionId ?? ""];
     const messageId = uid(), newRun = uid(), time = now();
     const guard = toolCallerBindings(sender.projectId, { run: sender, callId });
-    const source = json({ kind: "agent-message", senderRunId: sender.id, senderRole: sender.agentRole } satisfies AgentInputSource);
     await this.db.batch([
       // Select or create the current turn inside the same transaction as the delivery.
       this.db.prepare(`INSERT INTO runs(id,project_id,session_id,intent,status,stage,progress,label,payload,created_at,updated_at)
@@ -1175,14 +1228,18 @@ export class Store {
       if (source) payload.agent = { messages: source.messages, step: 0, seenUserIds: [], artifactIds: [],
         toolIndex: source.messages.findLast((message) => message.role === "assistant")?.tool_calls?.length ?? 0 };
     }
+    const parentPath = definition && parent.parentRunId ? memberAddresses(await this.collaborators(parent)).get(parent.id) : "";
     const memberName = definition ? allocateMemberName(this.memberNames(parent), name) : undefined;
     if (memberName) payload.memberName = memberName;
-    const result = { task_id: id, role, ...(definition ? { name: definition.name, member_name: memberName } : {}), generation: 1, status: "queued", ...(job?.background ? { background: true, path: outputPath } : {}) };
+    const result = { task_id: id, role, ...(definition ? { name: definition.name, member_name: joinMemberPath(parentPath, memberName) ?? id } : {}),
+      generation: 1, status: "queued", ...(job?.background ? { background: true, path: outputPath } : {}) };
     const memberGuard = memberName ? ` AND NOT EXISTS(SELECT 1 FROM runs r WHERE project_id=? AND session_id=? AND ${creativeChild("r")}
-      AND json_extract(payload,'$.memberName')=?)` : "";
-    const guard = toolCallerGuard + memberGuard + (outputPath ? " AND NOT EXISTS(" + outputBusy + ")" : "");
-    const guardArgs = [...toolCallerBindings(parent.projectId, { run: parent, callId }), ...(memberName ? [parent.projectId, parent.sessionId ?? "", memberName] : []),
-      ...(outputPath ? [parent.projectId, outputPath] : [])];
+      AND ${madeByAgent("r", "?")} AND json_extract(payload,'$.memberName')=?)` : "";
+    const capacityGuard = job?.background ? ` AND (${ownerJobs("?")}) < ?` : "";
+    const guard = toolCallerGuard + memberGuard + (outputPath ? " AND NOT EXISTS(" + outputBusy + ")" : "") + capacityGuard;
+    const guardArgs = [...toolCallerBindings(parent.projectId, { run: parent, callId }), ...(memberName ? [parent.projectId, parent.sessionId ?? "", parent.id, memberName] : []),
+      ...(outputPath ? [parent.projectId, outputPath] : []),
+      ...(job?.background ? [parent.projectId, parent.sessionId ?? "", parent.id, this.maxConcurrentJobsPerOwner] : [])];
     const mutation = this.db.prepare("INSERT INTO runs(id,project_id,intent,status,stage,progress,label,error,payload,lease_until,lease_token,created_at,updated_at,parent_run_id,agent_role,generation,input_version,background,session_id) SELECT ?,?,?,'queued',?,0,?,NULL,?,0,'',?,?,?,?,1,1,?,? WHERE " + guard)
         .bind(id, parent.projectId, "agent", job?.stage || "agent", definition ? "等待执行" : "准备制作", json(payload), t, t, parent.id, role, job?.background ? 1 : 0, parent.sessionId ?? "", ...guardArgs);
     const results = await this.db.batch([mutation,
@@ -1193,10 +1250,12 @@ export class Store {
     ]);
     if (!results[0].meta.changes) {
       const committed = await this.toolResult(parent.id, callId); if (committed) return committed;
-      if (memberName && this.memberNames(parent).has(memberName)) throw new AppError("同一对话已有此智能体名称", 409, "DUPLICATE_AGENT_NAME");
+      if (memberName && this.memberNames(parent).has(memberName)) throw duplicateAgentName();
       const busy = await busyOutput();
       if (busy) throw new AppError("该文件已有制作任务或未确认的提交，请先核对该任务：" + busy.id, 409, "OUTPUT_BUSY");
       const current = await this.run(parent.id, parent.projectId);
+      if (current.leaseToken === parent.leaseToken && current.inputVersion === parent.inputVersion && current.status === "running" &&
+          job?.background && this.jobLimitReached(parent.projectId, parent.sessionId ?? "", parent.id)) throw this.jobLimitError();
       throw new AppError("任务已停止或收到新输入", 409, current.inputVersion !== parent.inputVersion ? "AGENT_STEER" : "RUN_STOPPED");
     }
     return result;
@@ -1208,6 +1267,7 @@ export class Store {
     if (new Set(members.map(({ key }) => key)).size !== members.length) throw new AppError("批次任务标识应唯一", 400);
     validateDependencies(members.map(({ key, dependencies }) => ({ id: key, dependencies })));
     const id = uid(), time = now(), ids = new Map(members.map(({ key }) => [key, uid()]));
+    const parentPath = parent.parentRunId ? memberAddresses(await this.collaborators(parent)).get(parent.id) : "";
     const names = this.memberNames(parent);
     const jobs = members.map((member) => {
       const agentDefinition = roles.find((agent) => agent.id === member.role);
@@ -1216,15 +1276,16 @@ export class Store {
         batch: { id, title, key: member.key, dependencies: member.dependencies.map((key) => ids.get(key)!) } };
       return { ...member, id: ids.get(member.key)!, inbox: uid(), payload };
     });
-    const result = json({ batch_id: id, title, tasks: jobs.map(({ id, key, role }) => ({ task_id: id, key, role })) });
+    const result = json({ batch_id: id, title, tasks: jobs.map(({ id, key, role, payload }) => ({ task_id: id, key, role,
+      member_name: joinMemberPath(parentPath, payload.memberName) ?? id })) });
     const owned = "EXISTS(SELECT 1 FROM tool_receipts WHERE run_id=? AND call_id=? AND result=?)";
     const guard = [parent.id, callId, result];
     await this.db.batch([
       this.db.prepare(`INSERT INTO tool_receipts(run_id,call_id,result,created_at) SELECT ?,?,?,? WHERE ${toolCallerGuard}
         AND NOT EXISTS(SELECT 1 FROM runs r JOIN json_each(?) n ON json_extract(r.payload,'$.memberName')=n.value
-          WHERE r.project_id=? AND r.session_id=? AND ${creativeChild("r")})`)
+          WHERE r.project_id=? AND r.session_id=? AND ${creativeChild("r")} AND ${madeByAgent("r", "?")})`)
         .bind(...guard, time, ...toolCallerBindings(parent.projectId, { run: parent, callId }),
-          json(jobs.map(({ payload }) => payload.memberName)), parent.projectId, parent.sessionId ?? ""),
+          json(jobs.map(({ payload }) => payload.memberName)), parent.projectId, parent.sessionId ?? "", parent.id),
       this.db.prepare(`INSERT INTO runs(id,project_id,session_id,parent_run_id,agent_role,intent,status,stage,progress,label,payload,created_at,updated_at,input_version)
         SELECT json_extract(value,'$.id'),?,?,?,json_extract(value,'$.role'),'agent','queued','agent',0,
           CASE WHEN json_array_length(value,'$.dependencies')>0 THEN '等待依赖' ELSE '等待执行' END,json_extract(value,'$.payload'),?,?,1
@@ -1237,7 +1298,7 @@ export class Store {
     if (!receipt) {
       const used = this.memberNames(parent);
       if (jobs.some(({ payload }) => payload.memberName && used.has(payload.memberName)))
-        throw new AppError("同一对话已有此智能体名称", 409, "DUPLICATE_AGENT_NAME");
+        throw duplicateAgentName();
       throw new AppError("任务已停止或收到新输入", 409, "RUN_STOPPED");
     }
     return receipt;
@@ -1437,13 +1498,13 @@ export class Store {
         SELECT j.id,?,json_extract(n.value,'$.cursor'),json_extract(n.value,'$.terminal'),json_extract(n.value,'$.terminal')
         FROM json_each(?) n JOIN runs j ON j.id=json_extract(n.value,'$.jobId')
         WHERE j.project_id=? AND j.session_id=? AND j.background=1 AND ${currentAgent("j")}
-          AND (? IS NULL OR j.parent_run_id=?)
+          AND ${madeByAgent("j", "?")}
           AND ${taskNoticeToken("j")}=json_extract(n.value,'$.terminal')
           AND EXISTS(SELECT 1 FROM model_calls WHERE id=? AND run_id=? AND status='started')
         ON CONFLICT(job_id,owner) DO UPDATE SET cursor=MAX(cursor,excluded.cursor),
           terminal=excluded.terminal,observed_terminal=excluded.observed_terminal
         WHERE background_job_reads.terminal IS NOT excluded.terminal OR background_job_reads.cursor<excluded.cursor`)
-        .bind(agentIdentity(run), json(inlineNotices), run.projectId, run.sessionId ?? "", run.parentRunId, run.id, requestId, run.id)] : []),
+        .bind(agentIdentity(run), json(inlineNotices), run.projectId, run.sessionId ?? "", run.id, requestId, run.id)] : []),
     ]);
     if (!results[1].meta.changes) {
       const current = await this.run(run.id, run.projectId);
@@ -1564,7 +1625,13 @@ export class Store {
     const predicate = action === "cancel"
       ? "(status IN ('queued','running','waiting','paused','cancelled') OR (id=? AND status='failed'))"
       : "status IN ('queued','running','waiting','paused')";
-    const cancelPatch = action === "cancel" ? ",payload=" + cancelledRunPayload : "";
+    // Model interruption stops one creative agent's turn. User cancellation still operates on the tree.
+    const single = caller && !run.background && action === "cancel";
+    const cancelPatch = action !== "cancel" ? "" : ",payload=" + (single
+      ? `CASE WHEN status IN ('queued','running','waiting') THEN json_set(${cancelledRunPayload},'$.agentInterrupted',json('true')) ELSE payload END`
+      : cancelledRunPayload);
+    const scope = "SELECT id FROM runs WHERE id=? AND project_id=?";
+    const tree = single ? scope : scope + " UNION ALL SELECT r.id FROM runs r JOIN tree ON r.parent_run_id=tree.id WHERE r.background=0";
     await this.db.batch([
       ...(action === "cancel" && !run.parentRunId && !caller && run.intent === "agent" ? [this.db.prepare(`UPDATE chat_queue
         SET status='cancelled',version=version+1,updated_at=? WHERE project_id=? AND session_id=? AND status='pending'
@@ -1572,8 +1639,9 @@ export class Store {
           AND (target_run_id=? OR (target_run_id IS NULL AND NOT EXISTS(SELECT 1 FROM runs
             WHERE project_id=? AND session_id=? AND id<>? AND ${steeringRun})))`)
         .bind(now(), run.projectId, run.sessionId ?? "", run.id, run.projectId, run.id, run.projectId, run.sessionId ?? "", run.id)] : []),
-      this.db.prepare("WITH RECURSIVE tree(id) AS (SELECT id FROM runs WHERE id=? AND project_id=? UNION ALL SELECT r.id FROM runs r JOIN tree ON r.parent_run_id=tree.id WHERE r.background=0) UPDATE runs SET status=?,label=?,next_attempt_at=0,updated_at=?" + cancelPatch + " WHERE id IN (SELECT id FROM tree) AND " + predicate + (caller ? " AND " + toolCallerGuard : ""))
-        .bind(run.id, run.projectId, status, action === "pause" ? "已暂停" : "已取消", now(), ...(action === "cancel" ? [run.id] : []),
+      this.db.prepare("WITH RECURSIVE tree(id) AS (" + tree + ") UPDATE runs SET status=?,label=?,next_attempt_at=0,updated_at=?" + cancelPatch + " WHERE id IN (SELECT id FROM tree) AND " +
+        (single ? "status IN ('queued','running','waiting','cancelled')" : predicate) + (caller ? " AND " + toolCallerGuard : ""))
+        .bind(run.id, run.projectId, status, action === "pause" ? "已暂停" : single ? "已中断" : "已取消", now(), ...(action === "cancel" && !single ? [run.id] : []),
           ...(caller ? toolCallerBindings(run.projectId, caller) : [])),
       ...(caller ? [this.saveControlReceipt(run, action, caller)] : []),
       this.db.prepare("INSERT INTO events(project_id,type,data,created_at) SELECT ?,'run',?,? WHERE " + (caller ? "changes()=1" : "1"))
@@ -1584,16 +1652,21 @@ export class Store {
   }
   async resumeTree(run: Run, payload: RunPayload, caller?: ToolCaller) {
     const time = now();
+    const admitBackground = run.background && run.parentRunId && !["queued", "running", "waiting"].includes(run.status);
     const [result] = await this.db.batch([
-      this.db.prepare("UPDATE runs SET status='queued',generation=generation+CASE WHEN status IN ('failed','cancelled') THEN 1 ELSE 0 END,label='等待继续',error=NULL,error_code=NULL,attempts=0,next_attempt_at=0,payload=?,updated_at=? WHERE id=? AND project_id=? AND status=? AND lease_token=? AND agent_revision=? AND json_remove(payload,'$.agent','$.agentRevision')=json_remove(?,'$.agent','$.agentRevision') AND (status NOT IN ('failed','cancelled') OR NOT " + unfinishedAgentExecution + ") AND EXISTS(SELECT 1 FROM projects p WHERE p.id=runs.project_id AND p.status<>'archived') AND " + sessionActive("runs.project_id", "runs.session_id") + (caller ? " AND " + toolCallerGuard : ""))
+      this.db.prepare("UPDATE runs SET status='queued',generation=generation+CASE WHEN status IN ('failed','cancelled') THEN 1 ELSE 0 END,label='等待继续',error=NULL,error_code=NULL,attempts=0,next_attempt_at=0,payload=?,updated_at=? WHERE id=? AND project_id=? AND status=? AND lease_token=? AND agent_revision=? AND json_remove(payload,'$.agent','$.agentRevision')=json_remove(?,'$.agent','$.agentRevision') AND (status NOT IN ('failed','cancelled') OR NOT " + unfinishedAgentExecution + ") AND EXISTS(SELECT 1 FROM projects p WHERE p.id=runs.project_id AND p.status<>'archived') AND " + sessionActive("runs.project_id", "runs.session_id") + (caller ? " AND " + toolCallerGuard : "") +
+        (admitBackground ? ` AND (${ownerJobs("?", "runs.id")}) < ?` : ""))
         .bind(json(payload), time, run.id, run.projectId, run.status, run.leaseToken, run.agentRevision ?? 0, json(run.payload),
-          ...(caller ? toolCallerBindings(run.projectId, caller) : [])),
+          ...(caller ? toolCallerBindings(run.projectId, caller) : []),
+          ...(admitBackground ? [run.projectId, run.sessionId ?? "", run.parentRunId, this.maxConcurrentJobsPerOwner] : [])),
       ...(caller ? [this.saveControlReceipt(run, "resume", caller, "changes()=1", [])] : []),
       this.db.prepare("INSERT INTO events(project_id,type,data,created_at) SELECT ?,'run',?,? WHERE changes()=1")
         .bind(run.projectId, json({ id: run.id, action: "resume" }), time),
       this.db.prepare("WITH RECURSIVE descendants(id) AS (SELECT id FROM runs WHERE project_id=? AND parent_run_id=? AND background=0 UNION ALL SELECT r.id FROM runs r JOIN descendants d ON r.parent_run_id=d.id WHERE r.background=0) UPDATE runs SET status='queued',label='等待继续',next_attempt_at=0,updated_at=? WHERE changes()=1 AND status='paused' AND id IN (SELECT id FROM descendants)")
         .bind(run.projectId, run.id, time),
     ]);
+    if (!result.meta.changes && admitBackground && this.jobLimitReached(run.projectId, run.sessionId ?? "", run.parentRunId!, run.id))
+      throw this.jobLimitError();
     if (!result.meta.changes && !caller) throw new AppError("任务已更新，请重新操作", 409, "RUN_CHANGED");
   }
   async changeProjectFile(projectId: string, file: Artifact, path?: string) {
@@ -1672,7 +1745,7 @@ export class Store {
       AND i.id NOT IN (SELECT value FROM json_each(?))`;
     const pendingStep = "SELECT 1 FROM agent_inbox i WHERE i.project_id=runs.project_id AND i.run_id=runs.id AND i.target='next-step' AND i.state='pending'";
     const pendingBackground = `SELECT 1 FROM runs b WHERE b.project_id=runs.project_id AND b.session_id=runs.session_id AND b.background=1
-      AND (runs.parent_run_id IS NULL OR b.parent_run_id=runs.id)
+      AND ${madeByAgent("b", "runs.id")}
       AND b.status IN ('done','failed','cancelled','paused') AND ${currentAgent("b")}
       AND COALESCE(json_extract(?, '$."' || b.id || '"'),'')<>${taskNoticeToken("b")}`;
     const pendingChild = `SELECT 1 FROM runs c WHERE c.project_id=runs.project_id AND c.session_id=runs.session_id AND c.background=0

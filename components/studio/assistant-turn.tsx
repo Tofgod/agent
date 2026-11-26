@@ -11,7 +11,7 @@ type Action = "pause" | "resume" | "cancel" | "resubmit";
 const roles: Record<string, string> = { writer: "编剧", director: "导演", media: "制作", main: STUDIO_NAME };
 const roleName = (run?: Run) => run?.payload.agentDefinition?.name || (run ? roles[run.agentRole] || run.agentRole : roles.media);
 const names: Record<string, string> = { list_files: "查看目录", read_file: "读取文件", read_image: "查看图片", read_video: "创建视频检查任务", read_guide: "读取知识", web_search: "联网搜索", web_fetch: "阅读网页", list_agents: "查看协作任务", send_message: "发送协作消息", search_files: "搜索文件", write_file: "写入文件", edit_file: "修改文件", edit_files: "联动修改文件", move_file: "移动文件", rename_project: "命名项目", delegate: "委派任务", wait_for_tasks: "等待子任务", wait_for_input: "等待协作消息", control_task: "调整子任务", generate_image: "创建图片任务", generate_video: "创建视频任务", compose_video: "创建合成任务" };
-Object.assign(names, { present_files: "标记交付文件", delegate_batch: "委派批次", list_team_tasks: "查看协作清单",
+Object.assign(names, { skill: "读取技能", present_files: "标记交付文件", delegate_batch: "委派批次", list_team_tasks: "查看协作清单",
   save_team_task: "更新协作任务", list_tool_results: "查看工具记录", read_tool_result: "读取工具回执" });
 function readableError(message: string) {
   if (/An assistant message with.*tool_calls|insufficient tool messages/.test(message)) return "对话上下文缺少工具回执，请重试继续。";
@@ -66,7 +66,7 @@ function ToolRow({ step, owner, delegateName, rootId, projectId, files, onOpen }
     } catch (reason) { setError((reason as Error).message); }
     finally { setLoadingPart(false); }
   };
-  const Icon = working ? LoaderCircle : /web_/.test(step.name) ? Globe : /read_/.test(step.name) ? BookOpen : /write_|edit_|move_/.test(step.name) ? FilePenLine : /list_files|search_files/.test(step.name) ? FolderSearch : /video|image|production/.test(step.name) ? Film : /delegate|tasks|agents|message/.test(step.name) ? Workflow : Wrench;
+  const Icon = working ? LoaderCircle : /web_/.test(step.name) ? Globe : step.name === "skill" || /read_/.test(step.name) ? BookOpen : /write_|edit_|move_/.test(step.name) ? FilePenLine : /list_files|search_files/.test(step.name) ? FolderSearch : /video|image|production/.test(step.name) ? Film : /delegate|tasks|agents|message/.test(step.name) ? Workflow : Wrench;
   const file = files.find((file) => file.path === step.summary);
   const target = step.name === "delegate" ? delegateName || roles[step.summary] || step.summary : step.summary.replace(/^\/(?:01_创作|02_参考|03_图片|04_视频|05_音频|06_字幕|07_成片|08_记录)\//, "");
   const action = names[step.name] || "执行工具", label = step.status === "done" ? ["wait_for_tasks", "wait_for_input"].includes(step.name) ? "已结束等待" : "已" + action : action;
@@ -189,7 +189,7 @@ export function AssistantTurn({ run, content, control, controlBackground, runs, 
   const liveReplies = new Set(replies.filter((reply) => reply.status === "running" && reply.content.trim()).map((reply) => reply.runId));
   const liveTools = new Set(history.filter((step) => step.status === "running" && !isLiveWait(step, owners.get(step.runId))).map((step) => step.runId));
   const showRootActivity = run && isActiveRun(run) && (retrying || (
-    !liveReplies.has(run.id) && !liveTools.has(run.id) &&
+    !liveTools.has(run.id) &&
     (!activeChildren.length || run.label !== "等待子任务")
   ));
   const errors = (run ? [run, ...children] : []).filter((item) => !item.background && !item.payload.batch && item.error);
@@ -221,8 +221,8 @@ export function AssistantTurn({ run, content, control, controlBackground, runs, 
     })}
     {showStatus && !hasReply && (run?.streamText || content) && <MarkdownBody content={run?.streamText || content} files={files} onOpen={onOpen}/>}
     {showStatus && showRootActivity && <div className="execution-row" role="status"><span className="task-status-dot" data-running/><span>{retrying ?
-      (seconds ? seconds + " 秒后重试" : "等待重试") + (retryCount ? " · " + retryCount : "") : run.label}</span></div>}
-    {showStatus && activeChildren.filter((item) => !liveReplies.has(item.id) && !liveTools.has(item.id)).map((item) => <div className="execution-row" role="status" key={item.id}><span className="task-status-dot" data-running/><span>{roleName(item)}</span><span>{item.label}</span></div>)}
+      (seconds ? seconds + " 秒后重试" : "等待重试") + (retryCount ? " · " + retryCount : "") : liveReplies.has(run.id) ? "正在接收模型输出" : run.label}</span></div>}
+    {showStatus && activeChildren.filter((item) => !liveTools.has(item.id)).map((item) => <div className="execution-row" role="status" key={item.id}><span className="task-status-dot" data-running/><span>{roleName(item)}</span><span>{liveReplies.has(item.id) ? "正在接收模型输出" : item.label}</span></div>)}
     {showStatus && [...batches.entries()].map(([id, members]) => <details className="compact-task-list" key={id}>
       <summary>{members[0].payload.batch?.title} <small>{members.filter((item) => item.status === "done").length}/{members.length}</small></summary>
       {members.map((item) => <div className="execution-row" key={item.id}>

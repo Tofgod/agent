@@ -19,6 +19,8 @@ import { DEFAULT_SETTINGS } from "../../lib/studio/types";
 import { createToolRegistry } from "../../lib/studio/agent-tools";
 import { createAgentModel } from "../../lib/studio/providers";
 import { taskNotice, taskResult } from "../../lib/studio/agent-state";
+import { childExecution, preflightChildModel } from "../../lib/studio/child-execution";
+import { delegationParityProbe, innerFlowProbe, probeJobCapacity } from "./recovery-cases.mjs";
 import {
   authorizationCases, childPrompt, childTool, currentPrompt, earlierPrompt, earlierReply, firstDelta,
   imageTransportFixture, messagesHistory, messagesResponse, mixedArguments, overflowCases, peerMessage, peerReply, prunableReceipt, recentReceipt, requestReplay, secondDelta, shortenedHistory,
@@ -433,6 +435,169 @@ async function nestedDelegation() {
   } finally { db.close(); }
 }
 
+async function delegationFixture(db, names = delegationParityProbe.names) {
+  const store = new Store(db, { maxDelegationDepth: 2, completionDelivery: "quiet" });
+  const project = await store.createProject("local", {}), root = await send(store, project, "start");
+  const claim = async (id) => {
+    assert.ok(await store.claimRun(id, project.id));
+    return store.run(id, project.id);
+  };
+  const lead = await claim(root);
+  const spawn = (parent, name) => store.startChild(parent, crypto.randomUUID(), "writer", name, undefined, false, store.agents, name);
+  const branches = await Promise.all(names.map(async (name) => [name, await claim((await spawn(lead, name)).task_id)]));
+  return { store, project, lead, claim, spawn, actors: new Map(branches) };
+}
+
+async function nestedNames() {
+  const db = database(), { names, leaf } = delegationParityProbe;
+  try {
+    const { store, project, lead, spawn, actors } = await delegationFixture(db);
+    const children = await Promise.all(names.map((name) => spawn(actors.get(name), leaf)));
+    const addresses = children.map((child) => child.member_name);
+    assert.deepEqual(addresses, names.map((name) => name + "/" + leaf));
+    const registry = createToolRegistry({ store, run: lead, project, settings, tasks: [], ensureCurrent: async () => {} });
+    const execute = (name, args) => registry.execute(registry.prepare({ id: crypto.randomUUID(), type: "function",
+      function: { name, arguments: JSON.stringify(args) } }), AbortSignal.timeout(3_000));
+    const { result: catalog } = await execute("list_agents", {});
+    for (const address of addresses) assert.ok(catalog.agents.some(({ member_name }) => member_name === address));
+    const resolves = await Promise.all(addresses.map(async (address, i) =>
+      (await execute("send_message", { task_id: address, message: "choose this editor" })).result.task_id === children[i].task_id));
+    const siblingDuplicate = await spawn(actors.get(names[0]), leaf).then(() => false, (error) => error.code);
+    const invalidPath = await store.resolveCollaborator(lead, "missing/" + leaf).then(() => false, (error) => error.code);
+    assert.ok(await store.claimRun(children[0].task_id, project.id));
+    const sender = await store.run(children[0].task_id, project.id);
+    await store.sendAgentMessage(sender, "reply-to-peer", addresses[1], peerMessage);
+    let senderIdentified = false, parentIdentified = false;
+    await finish(store, project, children[1].task_id, async (_system, messages) => {
+      senderIdentified = messages.some(({ content, source }) => source?.kind === "agent-message" &&
+        source.senderName === addresses[0] && content.includes(addresses[0]) && content.endsWith(peerMessage));
+      parentIdentified = messages.some(({ source }) => source?.kind === "runtime-context" &&
+        source.sections.some(({ name, text }) => name === "identity" && JSON.parse(text).self.parent_name === names[1]));
+      return reply("settled");
+    });
+    return { addresses, resolves, siblingDuplicate, invalidPath, senderIdentified, parentIdentified,
+      bareLeafIsNotAChild: await store.resolveCollaborator(lead, leaf) === undefined };
+  } finally { db.close(); }
+}
+
+async function consecutiveInputWaits() {
+  const db = database(), probe = innerFlowProbe.wait;
+  try {
+    const { store, project, lead, actors } = await delegationFixture(db);
+    const actor = actors.get(delegationParityProbe.names[0]);
+    // Release the fixture's lease before the real execution loop takes over.
+    await store.releaseLease(actor);
+    await advanceRun(store, project, actor.id, settings, undefined, async () => assistantTools([
+      { id: "invalid", name: "wait_for_input", args: { timeout_ms: probe.invalid } },
+      ...probe.calls.map((id) => ({ id, name: "wait_for_input", args: { timeout_ms: probe.timeout } })),
+    ]));
+    await advanceRun(store, project, actor.id, settings, undefined, unexpectedModel);
+    assert.equal((await advanceRun(store, project, actor.id, settings, undefined, unexpectedModel)).status, "waiting");
+    await store.sendAgentMessage(lead, "fresh-input", actor.id, probe.message);
+    let result;
+    const settled = await finish(store, project, actor.id, async (_system, messages) => {
+      const receipt = (id) => JSON.parse(messages.find(({ tool_call_id }) => tool_call_id === id).content);
+      result = { invalid: receipt("invalid").code, receipts: probe.calls.map((id) => receipt(id).timedOut),
+        nextInput: messages.filter(({ content, source }) => source?.kind === "agent-message" && content.endsWith(probe.message)).length };
+      return reply("settled");
+    });
+    assert.equal(settled.status, "done");
+    return result;
+  } finally { db.close(); }
+}
+
+async function isolatedToolFailure() {
+  const db = database(), probe = innerFlowProbe.tool;
+  try {
+    const store = new Store(db), project = await store.createProject("local", {});
+    const id = await send(store, project, "write the draft and try the optional media"), path = "/01_创作/draft.md";
+    let step = 0, failure;
+    const run = await finish(store, project, id, async (_system, messages) => {
+      if (!step++) return assistantTools([
+        { id: probe.unavailable, name: "generate_image", args: { file_path: "/03_图片/test.png", prompt: "unused" } },
+        { id: probe.write, name: "write_file", args: { file_path: path, content: probe.text } },
+      ]);
+      failure = JSON.parse(messages.find(({ tool_call_id }) => tool_call_id === probe.unavailable).content).code;
+      return reply("draft ready");
+    });
+    return { failure, written: (await store.artifacts(project.id)).find((file) => file.path === path)?.content ?? "", replied: run.resultText === "draft ready" };
+  } finally { db.close(); }
+}
+
+async function interruptDescendant() {
+  const db = database(), probe = innerFlowProbe.control;
+  try {
+    const { store, project, lead, actors, spawn, claim } = await delegationFixture(db, [probe.a, probe.b]);
+    const a = actors.get(probe.a), b = actors.get(probe.b);
+    const leaf = await claim((await spawn(a, probe.leaf)).task_id);
+    const control = async (run, task_id) => {
+      const registry = createToolRegistry({ store, run, project, settings, tasks: await store.agentTasks(run), ensureCurrent: async () => {} });
+      return registry.execute(registry.prepare({ id: crypto.randomUUID(), type: "function",
+        function: { name: "control_task", arguments: JSON.stringify({ task_id, action: "cancel" }) } }), AbortSignal.timeout(3_000));
+    };
+    const siblingDenied = await control(b, probe.a + "/" + probe.leaf).then(() => false, (error) => error.code === "TASK_NOT_REACHABLE");
+    const { result } = await control(lead, probe.a);
+    const deeperKeptRunning = (await store.run(leaf.id, project.id)).status === "running";
+    await store.releaseLease(a);
+    const sent = await store.sendAgentMessage(lead, "continue-child", probe.a, probe.resume);
+    assert.equal(sent.task_id, a.id);
+    assert.equal((await store.run(a.id, project.id)).generation, a.generation + 1);
+    const done = await finish(store, project, a.id, async (_system, messages) => {
+      assert.ok(messages.some(({ content }) => content?.includes(probe.resume)));
+      return reply(probe.done);
+    });
+    return { siblingDenied, stopped: result.status === "cancelled", deeperKeptRunning, sameChild: done.id === a.id && done.resultText === probe.done };
+  } finally { db.close(); }
+}
+
+async function childReasoning() {
+  const { route, parentEffort, explicitEffort, configuredEffort } = delegationParityProbe;
+  const parent = { ...settings, textBaseUrl: "https://api.deepseek.com/anthropic", textThinking: true, textReasoningEffort: parentEffort };
+  const config = { textRoute: { ...route, reasoning_effort: configuredEffort } };
+  const resolved = [];
+  const run = async (request, definition?) => {
+    const execution = childExecution(request, parent, definition);
+    await preflightChildModel(execution, parent, AbortSignal.timeout(3_000), async (selected) => {
+      resolved.push(selected.textThinking ? selected.textReasoningEffort ?? null : "off");
+      return { id: selected.textModel, inputModalities: ["text"], thinking: [false, true], efforts: [parentEffort, explicitEffort] };
+    });
+  };
+  await assert.rejects(run({ reasoning_effort: explicitEffort }), { code: "INVALID_ARGS" });
+  await run({});
+  await run(route);
+  await run({ ...route, reasoning_effort: explicitEffort });
+  await run({}, config);
+  await run(route, config);
+  await run({ ...route, reasoning_effort: "off" });
+  return { effortOnlyRejected: true, resolved };
+}
+
+async function jobOwners() {
+  const db = database(), { log, limit } = delegationParityProbe;
+  try {
+    const { store, project, lead, claim, actors } = await delegationFixture(db);
+    const start = (owner, label) => newProbeJob(store, actors.get(owner), owner + "-" + label);
+    let stopping;
+    const stop = async (id) => {
+      stopping = await claim(id);
+      await store.controlTree(stopping, "cancel");
+    };
+    const id = await start("a", "owned"), job = await claim(id);
+    await store.appendBackgroundOutput(job, [log], "lines");
+    const read = async (run, wait = false) => {
+      const registry = createToolRegistry({ store, run, project, settings, tasks: await store.agentTasks(run), ensureCurrent: async () => {} });
+      return registry.execute(registry.prepare({ id: crypto.randomUUID(), type: "function", function: { name: "job_output",
+        arguments: JSON.stringify({ job_id: id, wait, timeout_ms: 10 }) } }), AbortSignal.timeout(3_000));
+    };
+    const trace = { owner: (await read(actors.get("a"))).result.text.includes(log),
+      lead: await read(lead).then(() => false, (error) => error.code),
+      peerWait: await read(actors.get("b"), true).then(() => false, (error) => error.code) };
+    assert.ok(!(await store.agentTasks(lead)).some(({ id: taskId }) => id === taskId));
+    await store.updateRun(job, { status: "done", resultText: "ready" });
+    return { trace, capacity: await probeJobCapacity(start, stop, async () => store.releaseLease(stopping), limit) };
+  } finally { db.close(); }
+}
+
 async function providerFinish(empty) {
   const db = database(), restoreFetch = globalThis.fetch;
   const bodies = [];
@@ -517,6 +682,14 @@ export async function studioRecoveryScenarios() {
   result["team mode and task transitions match the reference"] = await teamBoard();
   result["parallel delegation keeps distinct children and honors the nesting cap"] = await nestedDelegation();
   result["named child addresses reject duplicate sibling names"] = await namedChild();
+  const delegation = delegationParityProbe.cases, jobs = await jobOwners();
+  result[delegation.reasoning] = await childReasoning();
+  result[delegation.names] = await nestedNames();
+  result[delegation.output] = jobs.trace;
+  result[delegation.capacity] = jobs.capacity;
+  result[innerFlowProbe.wait.case] = await consecutiveInputWaits();
+  result[innerFlowProbe.tool.case] = await isolatedToolFailure();
+  result[innerFlowProbe.control.case] = await interruptDescendant();
   const crossTurn = await crossTurnCollaboration();
   for (const [key, name] of Object.entries(crossTurnProbe.cases)) result[name] = crossTurn[key];
   for (const scenario of childNoticeProbe.cases) result[scenario.name] = await childCompletionNotice(scenario);

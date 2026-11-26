@@ -20,7 +20,7 @@ import { scheduleInput, Schedules } from "@/lib/studio/schedules";
 import { traceAttachments, trajectory, trajectoryContent, trajectoryImages, trajectoryMessage } from "@/lib/studio/trajectory";
 import { presetToolCatalog } from "@/lib/studio/agent-tools";
 import { mcpCredentialName } from "@/lib/studio/mcp";
-import { canInvokeSkill } from "@/lib/studio/skills";
+import { canInvokeSkill, SKILL_BUNDLE_MAX_BYTES } from "@/lib/studio/skills";
 import { moveSession, searchSessions, sessionOutline, setSessionArchived, setSessionPinned } from "@/lib/studio/session-workspace";
 import { sessionMarkdown, sessionZip } from "@/lib/studio/session-export";
 export const dynamic = "force-dynamic";
@@ -171,7 +171,7 @@ async function handle(request: Request, context: Context): Promise<Response> {
       let total = 0;
       for (const [relative, file] of form) {
         if (relative === "scope") continue;
-        if (!(file instanceof File) || files.size >= 64 || files.has(relative) || (total += file.size) > 16 * 1024 * 1024)
+        if (!(file instanceof File) || files.size >= 64 || files.has(relative) || (total += file.size) > SKILL_BUNDLE_MAX_BYTES)
           throw new AppError("技能包最多包含 64 个文件及 16 MiB 内容", 413);
         files.set(relative, new Uint8Array(await file.arrayBuffer()));
       }
@@ -180,7 +180,26 @@ async function handle(request: Request, context: Context): Promise<Response> {
     }
     const scope = z.enum(["project", "global", "external"]).parse(p[3]);
     const name = p[4] ? skillName.parse(p[4]) : undefined;
-    if (method === "GET" && name) return Response.json({ text: library.source(project.id, scope, name, cwd) });
+    if (method === "GET" && name) {
+      const query = new URL(request.url).searchParams;
+      const resource = query.get("resource");
+      if (resource !== null) {
+        const bytes = library.file(project.id, scope, name, resource, cwd);
+        if (query.get("download") === "1") {
+          const filename = encodeURIComponent(resource.split("/").at(-1)!).replace(/['()*]/g, (character) => "%" + character.charCodeAt(0).toString(16));
+          return new Response(new Uint8Array(bytes), { headers: { "Content-Type": "application/octet-stream",
+            "Content-Disposition": "attachment; filename*=UTF-8''" + filename, "X-Content-Type-Options": "nosniff" } });
+        }
+        let text = null;
+        if (!bytes.includes(0)) {
+          try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+          catch { /* Binary resources can be downloaded. */ }
+        }
+        return Response.json({ text });
+      }
+      if (query.get("directory") === "1") return Response.json(await library.files(project.id, scope, name, cwd));
+      return Response.json({ text: library.source(project.id, scope, name, cwd) });
+    }
     if (scope === "external") throw new AppError("请在本机目录中编辑该技能", 403);
     if (method === "POST" && !name || method === "PUT" && name) {
       const { text } = z.strictObject({ text: z.string() }).parse(await bodyJson(request));

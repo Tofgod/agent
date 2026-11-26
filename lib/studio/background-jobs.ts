@@ -104,10 +104,7 @@ export async function consumeJobOutput(store: Store, run: Run, callId: string, j
   const cached = await store.toolResult(run.id, callId);
   if (cached) return cached;
   const owner = agentIdentity(run), db = store.db;
-  const job = await store.run(jobId, run.projectId);
-  if (!job.background || (job.sessionId ?? "") !== (run.sessionId ?? "") ||
-      (run.parentRunId && job.parentRunId !== run.id) || job.payload.inherited || job.payload.imported)
-    throw new AppError("后台任务不存在", 404, "JOB_NOT_FOUND");
+  const job = await store.ownedBackgroundJob(run, jobId);
   const prior = backgroundRead(store, owner, job.id);
   const frame = backgroundOutput(store, job, prior?.cursor ?? 0, null);
   const observed = taskResultReady(job) ? taskNoticeKey(job) : null;

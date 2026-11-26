@@ -1,8 +1,8 @@
 import { guideCatalog, PROJECT_GUIDES } from "./guidance";
 import { PROJECT_FOLDERS, PROJECT_MEMORY, projectDirectories } from "./project-layout";
-import { videoDurationLimits } from "./providers";
+import { videoDurationLimits } from "./video-input";
 import type { AgentMessage, Artifact, ContextSection, Project, ProviderSettings, Run } from "./types";
-import { agentIdentity } from "./agent-identity";
+import { agentIdentity, leadAgentId, memberAddresses } from "./agent-identity";
 
 /** Stable JSON avoids cache churn from database order or object insertion order. */
 function canonical(value: unknown): string {
@@ -31,13 +31,17 @@ export function projectContextSections(project: Project, run: Run, files: Runtim
   const listed = catalogPreview(files.map(({ path, kind, version, status }) => ({ path, kind, version, status }))
     .sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0), 4000);
   const allGuides = guideCatalog(files), guides = catalogPreview(allGuides, 1500);
+  const addresses = memberAddresses(collaborators);
+  const parentName = run.parentRunId && (addresses.get(run.parentRunId) ??
+    (addresses.has(run.parentRunId) ? run.parentRunId : leadAgentId));
   const allTasks = collaborators.filter((task) => agentIdentity(task) !== agentIdentity(run)).map((task) => ({ id: task.id, agent_id: agentIdentity(task),
-    member_name: task.payload.memberName, role: task.agentRole, parent: task.parentRunId,
+    member_name: task.background ? undefined : addresses.get(task.id) ?? agentIdentity(task), role: task.agentRole, parent: task.parentRunId,
     status: task.status, stage: task.stage, label: task.label, error: task.error, background: task.background, path: task.payload.operation?.path }))
     .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const tasks = catalogPreview(allTasks, 2200);
   return [
-    section("identity", { project: { id: project.id, title: project.title }, self: { agent_id: agentIdentity(run), task_id: run.id, role: run.agentRole, parent: run.parentRunId,
+    section("identity", { project: { id: project.id, title: project.title }, self: { agent_id: agentIdentity(run), member_name: addresses.get(run.id) ?? agentIdentity(run), task_id: run.id, role: run.agentRole, parent: run.parentRunId,
+      ...(parentName ? { parent_name: parentName } : {}),
       ...((run.payload.childExecution?.cwd ?? run.payload.workingDirectory) ? { cwd: run.payload.childExecution?.cwd ?? run.payload.workingDirectory, paths: "相对路径从工作目录解析，以 / 开头的路径从项目根目录解析。" } : {}),
       ...(run.payload.agentDefinition ? { agent: run.payload.agentDefinition } : {}) } }),
     section("files", { directories: [...roots, ...subdirs].sort(), files: listed,
@@ -46,7 +50,9 @@ export function projectContextSections(project: Project, run: Run, files: Runtim
     section("memory", { memory: memory ? { path: memory.path, version: memory.version, characters: "characters" in memory ? memory.characters : memory.content.length } : null }),
     section("knowledge", { guides, ...(guides.length < allGuides.length ? { total_guides: allGuides.length, directory: PROJECT_GUIDES, read_with: "list_files" } : {}) }),
     section("collaboration", { tasks, ...(tasks.length < allTasks.length ? { total_tasks: allTasks.length, read_with: "list_agents" } : {}) }),
-    section("capabilities", { webSearchEnabled: settings.webSearchEnabled, videoModel: settings.videoModel, shotDuration: videoDurationLimits(settings.videoModel) }),
+    section("capabilities", { webSearchEnabled: settings.webSearchEnabled, videoGeneration: {
+      model: settings.videoModel, singleRequestDurationSeconds: videoDurationLimits(settings.videoModel),
+    } }),
   ];
 }
 
@@ -70,5 +76,5 @@ export function summaryMessage(text: string): AgentMessage {
 
 /** Don't turn stale catalogues into remembered facts. Literal user messages are always preserved. */
 export function summaryInput(messages: AgentMessage[]) {
-  return messages.filter((message) => message.source?.kind !== "runtime-context");
+  return messages.filter((message) => message.source?.kind !== "runtime-context" && message.source?.kind !== "skill-catalog");
 }

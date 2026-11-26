@@ -15,7 +15,7 @@ export interface AgentImage { id: string; version: number; path: string; objectK
 export interface ModelUsage { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens?: number; cacheWriteInputTokens?: number }
 export interface ContextMeasurement { inputTokens: number; estimatedTokens: number; modelKey: string }
 export interface ContextSection { name: string; text: string }
-export type AgentInputSource = { kind: "agent-message" | "delegation"; senderRunId: string; senderRole: AgentRole } |
+export type AgentInputSource = { kind: "agent-message" | "delegation"; senderRunId: string; senderRole: AgentRole; senderName?: string } |
   { kind: "schedule-change"; id: string };
 export interface AgentInput { id: string; content: string; attachments?: MessageAttachment[]; source?: AgentInputSource; scheduled?: boolean; scheduledFrame?: string }
 export interface BackgroundOutputClaim { jobId: string; cursor: number; terminal: string }
@@ -26,6 +26,12 @@ export interface ModelAttemptTrace {
 }
 export const reasoningEfforts = ["low", "high", "max"] as const;
 export type ReasoningEffort = typeof reasoningEfforts[number];
+export interface SkillCatalogSource {
+  kind: "skill-catalog";
+  entries: { name: string; description: string }[];
+  update?: true;
+  incomplete?: true;
+}
 export interface AgentMessage { role: "system" | "user" | "assistant" | "tool"; content: string | null; tool_calls?: AgentToolCall[]; tool_call_id?: string; images?: AgentImage[]; outputRef?: string;
   finishReason?: "max-tokens";
   attemptTrace?: ModelAttemptTrace;
@@ -33,9 +39,10 @@ export interface AgentMessage { role: "system" | "user" | "assistant" | "tool"; 
   messagesReplay?: MessagesReplay;
   chatReasoning?: { endpoint: string; model: string; text: string };
   source?: { kind: "runtime-context"; sections: ContextSection[] } | { kind: "compaction" } | { kind: "task-result"; inlineOutput?: BackgroundOutputClaim } |
-    { kind: "repeat-tool-reminder"; tool: string; count: number } | { kind: "tool-context" } | { kind: "session-reference"; snapshotIds?: string[] } | AgentInputSource; }
+    { kind: "repeat-tool-reminder"; tool: string; count: number } | { kind: "tool-context" } | { kind: "session-reference"; snapshotIds?: string[] } |
+    SkillCatalogSource | { kind: "skill-invocation"; name: string } | { kind: "model-recovery" } | AgentInputSource; }
 export type AgentRole = string;
-export interface AgentDefinition { id: AgentRole; name: string; description?: string; textRoute?: { provider: "chat-completions" | "messages"; model: "deepseek-flash"; reasoning_effort?: ReasoningEffort } }
+export interface AgentDefinition { id: AgentRole; name: string; description?: string; textRoute?: { provider: "chat-completions" | "messages"; model: "deepseek-flash"; reasoning_effort?: ReasoningEffort | "off" } }
 export interface AgentState { messages: AgentMessage[]; seenUserIds: string[]; step: number; toolIndex: number; artifactIds: string[]; summary?: string;
   parentMessageCallId?: string;
   childNotices?: Record<string, string>; waitingFor?: string[]; waitingForJob?: true; waitingForTasksUntil?: number; waitingForInputUntil?: number; waitingInputVersion?: number; pendingRequest?: { id: string }; observedVersions?: Record<string, number>; contextMeasurement?: ContextMeasurement;
@@ -44,6 +51,7 @@ export interface AgentState { messages: AgentMessage[]; seenUserIds: string[]; s
   contextRoute?: { baseUrl: string; model: ProviderSettings["textModel"] };
   unadmittedInputStart?: number;
   unadmittedInputIds?: string[];
+  skillCatalogPublished?: true;
   contextRecovery?: "needed" | "used";
   contextOverflow?: { turn: number; step: number; attempt: number; error: string; pruned?: true };
   compactionBypass?: boolean;
@@ -105,6 +113,7 @@ export interface RunPayload {
   modelRetry?: ModelRetryRecord;
   modelDirectRetry?: string;
   stoppedBySessionArchive?: boolean;
+  agentInterrupted?: true;
   batch?: { id: string; title: string; key: string; dependencies: string[] };
   production?: { toolCallId: string; mode: "frames" | "videos" | "compose"; scriptId?: string; storyboardId: string };
   operation?: { toolCallId: string; name: "generate_image" | "generate_video" | "compose_video"; path: string;

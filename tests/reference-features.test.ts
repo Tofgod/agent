@@ -233,7 +233,7 @@ test("collaborators can message peers and parents durably, with receipt deduplic
   const [assignment, peer] = received;
   assert.equal(received.length, 2);
   assert.deepEqual(assignment.source, { kind: "delegation", senderRunId: parent.id, senderRole: "main" });
-  assert.deepEqual(peer, { id: result.message_id, content: "请保留门后的停顿", source: { kind: "agent-message", senderRunId: writer.id, senderRole: "writer" } });
+  assert.deepEqual(peer, { id: result.message_id, content: "请保留门后的停顿", source: { kind: "agent-message", senderRunId: writer.id, senderRole: "writer", senderName: "agent-1" } });
   assert.ok((await restarted.inputs(await restarted.run(parent.id, project.id))).some((m) => m.content.includes("需要先确定结尾")));
   const tasks = await restarted.collaborators(writer); assert.equal(tasks.length, 3);
 });

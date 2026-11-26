@@ -20,6 +20,7 @@ import { SkillLibrary } from "../lib/studio/skills";
 import { McpManager } from "../lib/studio/mcp";
 import { PresetPlugins, readLocalPlugins } from "../lib/studio/preset-plugins";
 import { Schedules } from "../lib/studio/schedules";
+import { startScheduleDriver } from "./schedule-driver";
 import { resolveLiveDeepSeekModel } from "../lib/studio/providers";
 import { localConfig } from "../scripts/local-config.mjs";
 import { createLocalWorker } from "../scripts/local-worker.mjs";
@@ -49,6 +50,7 @@ const runtimeOptions = {
   maxParallelTools: env.STUDIO_MAX_PARALLEL_TOOLS ? Number(env.STUDIO_MAX_PARALLEL_TOOLS) : undefined,
   maxDelegationDepth: env.STUDIO_MAX_DELEGATION_DEPTH !== undefined ? Number(env.STUDIO_MAX_DELEGATION_DEPTH) : undefined,
   maxConsecutiveWakes: env.STUDIO_MAX_CONSECUTIVE_WAKES !== undefined ? Number(env.STUDIO_MAX_CONSECUTIVE_WAKES) : undefined,
+  maxConcurrentJobsPerOwner: env.STUDIO_MAX_CONCURRENT_JOBS_PER_OWNER !== undefined ? Number(env.STUDIO_MAX_CONCURRENT_JOBS_PER_OWNER) : undefined,
   jobWaitTimeout: env.STUDIO_JOB_WAIT_TIMEOUT_MS !== undefined ? Number(env.STUDIO_JOB_WAIT_TIMEOUT_MS) : undefined,
   maxJobWaitTimeout: env.STUDIO_JOB_MAX_WAIT_TIMEOUT_MS !== undefined ? Number(env.STUDIO_JOB_MAX_WAIT_TIMEOUT_MS) : undefined,
   completionDelivery: env.STUDIO_JOB_COMPLETION_DELIVERY === "quiet" ? "quiet" as const : "wakeup" as const,
@@ -116,22 +118,25 @@ await new Promise<void>((resolve, reject) => { server.once("error", reject); ser
 console.log(STUDIO_NAME + " · http://" + host + ":" + port + "\n本地数据库：" + path.join(dataDir, "studio.sqlite") + "\n后台持续执行已启动");
 const runner = createLocalWorker({ baseUrl: "http://127.0.0.1:" + port, token: workerSecret, onError: (error: Error) => console.error("[后台]", error.message) });
 const running = runner.run(lifecycle.signal);
-const schedules = new Schedules(recovery);
-let backgroundTick: Promise<void> | undefined;
-const dispatchSchedules = () => {
-  backgroundTick ??= schedules.runDue().then(() => presetPlugins.sweep()).catch((error: Error) => {
-    console.error("[定时任务]", error.name);
-  }).finally(() => { backgroundTick = undefined; });
+const stopSchedules = startScheduleDriver(database, new Schedules(recovery), (error) => {
+  console.error("[定时任务]", error instanceof Error ? error.name : String(error));
+});
+let pluginSweep: Promise<void> | undefined;
+const sweepPlugins = () => {
+  pluginSweep ??= presetPlugins.sweep().catch((error: Error) => {
+    console.error("[会话扩展]", error.name);
+  }).finally(() => { pluginSweep = undefined; });
 };
-dispatchSchedules();
-const scheduleTimer = setInterval(dispatchSchedules, 1000);
-scheduleTimer.unref();
+sweepPlugins();
+const sweepTimer = setInterval(sweepPlugins, 1000);
+sweepTimer.unref();
 let stopping = false;
 async function stop() {
   if (stopping) return;
-  stopping = true; clearInterval(scheduleTimer); lifecycle.abort();
+  stopping = true; clearInterval(sweepTimer); lifecycle.abort();
+  const schedulesStopped = stopSchedules();
   skills.close();
-  await running; await backgroundTick; await presetPlugins.close(); await mcp.close(); await disk.close(); await vite?.close();
+  await running; await schedulesStopped; await pluginSweep; await presetPlugins.close(); await mcp.close(); await disk.close(); await vite?.close();
   server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); database.close();
 }
 process.once("SIGINT", () => { void stop(); }); process.once("SIGTERM", () => { void stop(); });

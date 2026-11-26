@@ -11,7 +11,7 @@ import { openStudioZip, streamZip, type ZipEntry } from "./zip";
 import { leadAgentId } from "./agent-identity";
 import { JOB_OUTPUT_RETAIN_BYTES, type JobOutputChannel } from "./background-jobs";
 import { replaySession, type SessionEntry, type SessionPatch } from "./session-journal";
-import { presetInput } from "./session-presets";
+import { presetInput, skillName } from "./session-presets";
 import { parseToolArguments } from "./tool-history";
 import { committedRunEvent, runBoundaries } from "./session-fork";
 
@@ -140,7 +140,8 @@ export function projectArchive(store: Store, projectId: string, bucket: BlobStor
   const archiveMessage = ({ images, source, ...message }: AgentMessage) => ({
     ...message,
     ...(source?.kind === "runtime-context" || source?.kind === "compaction" || source?.kind === "session-reference" ||
-      source?.kind === "schedule-change" ? { source } : {}),
+      source?.kind === "schedule-change" || source?.kind === "model-recovery" ||
+      source?.kind === "skill-catalog" || source?.kind === "skill-invocation" ? { source } : {}),
     ...(images?.length ? { images: images.map(archiveImage) } : {}),
   });
   const archiveSteps = steps.map(({ output_images, receipt_result, ...step }) => ({
@@ -219,8 +220,12 @@ const forkMessage = z.object({
     z.object({ type: z.literal("tool_use"), callIndex: z.number().int().nonnegative().safe() }),
   ])) }).optional(),
   source: z.union([z.object({ kind: z.literal("compaction") }),
+    z.object({ kind: z.literal("model-recovery") }),
     z.object({ kind: z.literal("schedule-change"), id: label }),
     z.object({ kind: z.literal("session-reference"), snapshotIds: z.array(identifier).optional() }),
+    z.object({ kind: z.literal("skill-catalog"), entries: z.array(z.object({ name: skillName, description: z.string().max(500) })),
+      update: z.literal(true).optional(), incomplete: z.literal(true).optional() }),
+    z.object({ kind: z.literal("skill-invocation"), name: skillName }),
     z.object({ kind: z.literal("runtime-context"), sections: z.array(z.object({ name: z.string(), text: z.string() })) })]).optional(),
   images: z.array(receiptImage).optional(),
 });

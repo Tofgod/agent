@@ -1,8 +1,8 @@
 "use client";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { FileText, Folder, Plus, Trash2 } from "lucide-react";
 import { NativeSelect } from "@/components/ui/native-select";
-import type { ManagedSkillScope, SkillEntry } from "@/lib/studio/skills";
+import type { ManagedSkillScope, SkillDirectory, SkillEntry } from "@/lib/studio/skills";
 import type { McpProbeView, McpServerView } from "@/lib/studio/mcp";
 import type { SessionPreset } from "@/lib/studio/session-presets";
 import type { ScheduleHistory, ScheduleRecord } from "@/lib/studio/schedules";
@@ -80,31 +80,84 @@ function EditActions({ busy, onClose, onDelete, name, saveDisabled, closeLabel =
   </div>;
 }
 
+function SkillFiles({ endpoint, file, onSelect, children }: { endpoint: string; file: string; onSelect: (path: string) => void; children: ReactNode }) {
+  const [directory, setDirectory] = useState<SkillDirectory>();
+  const [directoryError, setDirectoryError] = useState("");
+  const [preview, setPreview] = useState<{ path: string; text: string | null; error?: string }>();
+  const query = endpoint.includes("?") ? "&" : "?";
+  const resource = file ? endpoint + query + "resource=" + encodeURIComponent(file) : "";
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<SkillDirectory>(endpoint + query + "directory=1", { signal: controller.signal })
+      .then((items) => { if (!controller.signal.aborted) setDirectory(items); })
+      .catch((error) => { if (!controller.signal.aborted) setDirectoryError(errorMessage(error)); });
+    return () => controller.abort();
+  }, [endpoint, query]);
+  useEffect(() => {
+    if (!resource) return;
+    const controller = new AbortController();
+    void api<{ text: string | null }>(resource, { signal: controller.signal })
+      .then(({ text }) => { if (!controller.signal.aborted) setPreview({ path: file, text }); })
+      .catch((error) => { if (!controller.signal.aborted) setPreview({ path: file, text: null, error: errorMessage(error) }); });
+    return () => controller.abort();
+  }, [resource, file]);
+  const current = preview?.path === file ? preview : undefined;
+  return <div className="skill-workspace">
+    <nav className="skill-file-list" aria-label="技能目录">
+      <ul>
+        <li><button type="button" aria-current={!file ? "true" : undefined} onClick={() => onSelect("")}>
+          <FileText size={14} aria-hidden="true"/><span>{directory?.entry ?? "SKILL.md"}</span>
+        </button></li>
+        {directory?.files.map(({ path, kind }) => {
+          const parts = path.split("/"), label = parts.at(-1);
+          const style = { paddingInlineStart: 8 + Math.min(parts.length - 1, 6) * 10 };
+          return <li key={path}>{kind === "directory" ? <div className="skill-folder" style={style} title={path}>
+            <Folder size={14} aria-hidden="true"/><span>{label}</span>
+          </div> : <button type="button" style={style} title={path} aria-current={file === path ? "true" : undefined} onClick={() => onSelect(path)}>
+            <FileText size={14} aria-hidden="true"/><span>{label}</span>
+          </button>}</li>;
+        })}
+      </ul>
+      {directoryError && <Feedback error={directoryError}/>}
+    </nav>
+    <div className="extension-editor" hidden={Boolean(file)}>{children}</div>
+    {file && <section className="extension-editor skill-file-preview" aria-label="技能文件预览">
+      <header title={file}>{file}</header>
+      {current?.error ? <Feedback error={current.error}/> : !current ? <p role="status">读取中…</p> : current.text === null
+        ? <a className="button" href={"/api/studio" + resource + "&download=1"} download>下载文件</a>
+        : <pre className="raw-content">{current.text}</pre>}
+    </section>}
+  </div>;
+}
+
 function SkillsPanel({ endpoint, session, readOnly, initial }: { endpoint: string; session: string; readOnly: boolean; initial?: SkillEntry }) {
   const remote = useItems<SkillEntry>(endpoint + "/skills" + scopeQuery(session), "/api/studio" + endpoint + "/skills/watch" + scopeQuery(session), true);
   const [edit, setEdit] = useState<{ name?: string; scope: SkillEntry["scope"]; text: string } | null>(null);
   const [scope, setScope] = useState<ManagedSkillScope>("project");
+  const [file, setFile] = useState("");
   const show = async (item: SkillEntry) => {
     const { text } = await api<{ text: string }>(endpoint + "/skills/" + item.scope + "/" + item.name + scopeQuery(session));
-    setEdit({ name: item.name, scope: item.scope, text });
+    setFile(""); setEdit({ name: item.name, scope: item.scope, text });
   };
   useEffect(() => { if (initial) void remote.act(() => show(initial)); }, [initial]);
   const locked = readOnly || edit?.scope === "external" || edit?.scope === "provider";
-  const save = () => edit && !locked && remote.act(async () => {
+  const save = () => edit && !locked && !file && remote.act(async () => {
     await api(endpoint + "/skills/" + edit.scope + (edit.name ? "/" + edit.name : ""), json(edit.name ? "PUT" : "POST", { text: edit.text }));
     await remote.reload(); setEdit(null);
   });
+  const editor = edit && <MarkdownEditor value={edit.text} readOnly={locked} onChange={(text) => setEdit({ ...edit, text })} onSave={() => void save()}/>;
+  const skillPath = edit?.name && edit.scope !== "provider" ? endpoint + "/skills/" + edit.scope + "/" + edit.name + scopeQuery(session) : "";
   if (edit) return <form className="extension-form" onSubmit={(event) => { event.preventDefault(); void save(); }}>
     <div className="form-fields">
       <div className="form-row"><label>范围<NativeSelect value={edit.scope} disabled={Boolean(edit.name) || locked}
         onChange={(event) => setEdit({ ...edit, scope: event.target.value as SkillEntry["scope"] })}><option value="project">当前项目</option><option value="global">所有项目</option><option value="external">本机目录</option><option value="provider">扩展来源</option></NativeSelect></label>
-        <label>导入 SKILL.md<input type="file" accept=".md,text/markdown" disabled={locked}
-          onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void remote.act(async () => setEdit({ ...edit, text: await file.text() })); }}/></label></div>
-      <div className="extension-editor"><MarkdownEditor value={edit.text} readOnly={locked} onChange={(text) => setEdit({ ...edit, text })} onSave={() => void save()}/></div>
+        {!file && <label>导入 SKILL.md<input type="file" accept=".md,text/markdown" disabled={locked}
+          onChange={(event) => { const file = event.currentTarget.files?.[0]; if (file) void remote.act(async () => setEdit({ ...edit, text: await file.text() })); }}/></label>}</div>
+      {skillPath ? <SkillFiles key={skillPath} endpoint={skillPath} file={file} onSelect={setFile}>{editor}</SkillFiles> : <div className="extension-editor">{editor}</div>}
     </div>
     <div className="extension-edit-footer">
       <Feedback error={remote.error}/>
-      {locked ? <button type="button" className="button" onClick={() => setEdit(null)}>返回</button> : <EditActions key={edit.name ?? "new"} busy={remote.busy} onClose={() => setEdit(null)} name={edit.name}
+      {locked || file ? <button type="button" className="button" onClick={() => file ? setFile("") : setEdit(null)}>返回</button> : <EditActions key={edit.name ?? "new"} busy={remote.busy} onClose={() => setEdit(null)} name={edit.name}
         onDelete={edit.name ? () => void remote.act(async () => {
           await api(endpoint + "/skills/" + edit.scope + "/" + edit.name, json("DELETE")); await remote.reload(); setEdit(null);
         }) : undefined}/>}
@@ -259,7 +312,7 @@ function McpPanel() {
   </div>;
 }
 
-function PresetsPanel({ endpoint, session, readOnly }: { endpoint: string; session: string; readOnly: boolean }) {
+function PresetsPanel({ endpoint, session, readOnly, onPresetChange }: { endpoint: string; session: string; readOnly: boolean; onPresetChange: () => void }) {
   const path = "/extensions/presets", binding = endpoint + "/preset" + scopeQuery(session);
   const remote = useItems<SessionPreset>(path);
   const [chosen, setChosen] = useState<SessionPreset | null>(null);
@@ -329,6 +382,7 @@ function PresetsPanel({ endpoint, session, readOnly }: { endpoint: string; sessi
       event.preventDefault();
       void remote.act(async () => {
         setChosen(await api<SessionPreset | null>(binding, json("PUT", { id: selection || null })));
+        onPresetChange();
       });
     }}>
       <label>当前对话<NativeSelect size="sm" name="preset" value={selection} disabled={readOnly || !loaded || remote.busy}
@@ -616,9 +670,9 @@ function SchedulesPanel({ projectId, session, sessions, readOnly, onOpen, drafts
   </div>;
 }
 
-export function StudioExtensions({ projectId, session, sessions, readOnly, initial, skill, onClose, onOpenSession }: {
+export function StudioExtensions({ projectId, session, sessions, readOnly, initial, skill, onClose, onOpenSession, onPresetChange }: {
   projectId: string; session: string; sessions: ProjectSession[]; readOnly: boolean; initial: Tab;
-  skill?: SkillEntry; onClose: () => void; onOpenSession: (id: string, projectId: string) => void;
+  skill?: SkillEntry; onClose: () => void; onOpenSession: (id: string, projectId: string) => void; onPresetChange: () => void;
 }) {
   const [tab, setTab] = useState<Tab>(initial);
   const scheduleDrafts = useRef(new Map<string, ScheduleDraft>());
@@ -629,7 +683,7 @@ export function StudioExtensions({ projectId, session, sessions, readOnly, initi
     <div className="modal-scroll" key={tab}>
       {tab === "skills" && <SkillsPanel endpoint={endpoint} session={session} readOnly={readOnly} initial={skill}/>}
       {tab === "mcp" && <McpPanel/>}
-      {tab === "presets" && <PresetsPanel endpoint={endpoint} session={session} readOnly={readOnly}/>}
+      {tab === "presets" && <PresetsPanel endpoint={endpoint} session={session} readOnly={readOnly} onPresetChange={onPresetChange}/>}
       {tab === "schedules" && <SchedulesPanel projectId={projectId} session={session} sessions={sessions} readOnly={readOnly} onOpen={onOpenSession}
         drafts={scheduleDrafts.current}/>}
     </div>

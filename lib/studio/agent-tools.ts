@@ -13,7 +13,7 @@ import { teamTools } from "./team-tools";
 import { scheduleTools, skillTools } from "./extension-tools";
 import { childExecution, childFields, childParameters, preflightChildModel, structuredOutputTool } from "./child-execution";
 import { validateJsonSchemaValue } from "./harness/json-schema";
-import { agentIdentity, leadAgentId } from "./agent-identity";
+import { agentIdentity, memberAddresses } from "./agent-identity";
 
 const string = { type: "string" }, integer = { type: "integer" };
 const presetChoice = ({ preset }: Pick<ToolContext, "preset">) =>
@@ -122,15 +122,16 @@ const collaborationTools: ToolRegistration[] = [
     },
   },
   {
-    schema: tool("list_agents", "查看当前协作会话中的智能体和项目后台任务。", {}),
+    schema: tool("list_agents", "查看当前协作会话中的智能体和自己创建的后台任务。", {}),
     label: "查看协作任务", mode: "parallel",
     async execute({ store, run, tasks }) {
       const actors = await store.collaborators(run);
+      const addresses = memberAddresses(actors);
       const entries = [...new Map([...actors, ...tasks].map((item) => [item.id, item])).values()];
-      return { result: { self: agentIdentity(run), current_run_id: run.id, agents: entries.map((item) => ({
+      return { result: { self: agentIdentity(run), self_name: addresses.get(run.id) ?? agentIdentity(run), current_run_id: run.id, agents: entries.map((item) => ({
         agent_id: agentIdentity(item),
         task_id: item.id, role: item.agentRole, name: item.payload.agentDefinition?.name,
-        member_name: item.parentRunId ? item.payload.memberName : leadAgentId, parent: item.parentRunId,
+        member_name: item.background ? undefined : addresses.get(item.id) ?? agentIdentity(item), parent: item.parentRunId,
         status: item.status, label: item.label, background: item.background, path: item.payload.operation?.path,
       })) } };
     },
@@ -146,7 +147,7 @@ const collaborationTools: ToolRegistration[] = [
   {
     name: "delegate",
     schema: ({ store, run, settings, preset, roles = store.agents }) => run.agentRole !== "media" && roles.length ? tool("delegate",
-      "启动已注册角色的独立子智能体。context=fork 可在父对话已完成的历史上开始。要继续已有子任务，用 send_message 按任务编号继续。",
+      "启动已注册角色的独立子智能体。同一创建者下名称唯一，嵌套智能体通过完整路径寻址。context=fork 可继承已完成的对话历史。用 send_message 联系已有智能体。",
       { role: { type: "string", enum: roles.map((agent) => agent.id),
         description: roles.map(({ id, name, description }) => id + " · " + name + (description ? " · " + description : "")).join("\n") },
         instruction: string, name: string, context: { type: "string", enum: ["fresh", "fork"] }, ...childParameters(settings),
@@ -163,16 +164,15 @@ const collaborationTools: ToolRegistration[] = [
     },
   },
   {
-    schema: tool("job_output", "读取后台任务自上次读取后的输出和最终结果，默认立即返回。more=true 时可继续读取。仅在依赖任务完成时设 wait=true。",
+    schema: tool("job_output", "读取自己创建的后台任务自上次读取后的输出和最终结果，默认立即返回。more=true 时可继续读取。仅在依赖任务完成时设 wait=true。",
       { job_id: string, wait: { type: "boolean" }, timeout_ms: { ...integer, minimum: 1 } }, ["job_id"]),
     label: "读取后台任务输出",
-    async execute({ store, run, tasks }, callId, args) {
+    async execute({ store, run }, callId, args) {
       const { job_id, wait, timeout_ms } = z.object({ job_id: z.string(), wait: z.boolean().default(false),
         timeout_ms: z.number().int().positive().safe().optional() }).parse(args);
-      const job = tasks.find((entry) => entry.id === job_id && entry.background && (!run.parentRunId || entry.parentRunId === run.id));
-      if (!job) throw new AppError("后台任务不存在", 404, "JOB_NOT_FOUND");
-      if (wait && !taskResultReady(job)) return { waitFor: [job.id], waitForTasksUntil: Date.now() + Math.min(timeout_ms ?? store.jobWaitTimeout, store.maxJobWaitTimeout) };
-      const result = await consumeJobOutput(store, run, callId, job.id);
+      if (wait && !taskResultReady(await store.ownedBackgroundJob(run, job_id)))
+        return { waitFor: [job_id], waitForTasksUntil: Date.now() + Math.min(timeout_ms ?? store.jobWaitTimeout, store.maxJobWaitTimeout) };
+      const result = await consumeJobOutput(store, run, callId, job_id);
       return { result };
     },
   },
@@ -195,17 +195,19 @@ const collaborationTools: ToolRegistration[] = [
       { timeout_ms: { type: "integer", minimum: 10000, maximum: 3600000, default: 30000 } }),
     label: "等待协作消息",
     async execute(_context, _id, args) {
-      const { timeout_ms } = z.object({ timeout_ms: z.number().int().min(10000).max(3600000).default(30000) }).parse(args);
+      const { timeout_ms } = z.object({ timeout_ms: z.number().default(30000) }).parse(args);
+      if (!Number.isSafeInteger(timeout_ms) || timeout_ms < 10_000 || timeout_ms > 3_600_000)
+        throw new AppError("等待时间必须是 10000 至 3600000 毫秒的整数", 400, "WAIT_INVALID_TIMEOUT");
       return { waitForInputUntil: Date.now() + timeout_ms };
     },
   },
   {
-    schema: tool("control_task", "暂停、继续或取消当前会话可访问的任务。供应商的取消结果以 cancellation 状态为准。", { ...task, action: { type: "string", enum: ["pause", "resume", "cancel"] } }, ["task_id", "action"]),
+    schema: tool("control_task", "暂停、继续或取消自己可控制的任务。子智能体可用完整名称或任务编号。取消子智能体只中断其当前工作，可发消息继续。供应商的取消结果以 cancellation 状态为准。", { ...task, action: { type: "string", enum: ["pause", "resume", "cancel"] } }, ["task_id", "action"]),
     label: "调整子任务",
     async execute({ store, run, tasks, settings }, callId, args) {
       const input = z.object({ task_id: z.string(), action: z.enum(["pause", "resume", "cancel"]) }).parse(args);
-      const child = tasks.find((item) => item.id === input.task_id);
-      if (!child) throw new AppError("只能控制当前会话可访问的任务");
+      const child = tasks.find((item) => item.id === input.task_id) ?? await store.resolveCollaborator(run, input.task_id);
+      if (!child) throw new AppError("只能控制当前会话可访问的任务", 403, "TASK_NOT_REACHABLE");
       return { result: await controlTaskFromTool(store, child, input.action, settings, { run, callId }) };
     },
   },

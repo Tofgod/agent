@@ -4,7 +4,7 @@ import { AppError } from "./security";
 import { scheduleInput, Schedules } from "./schedules";
 import { skillName } from "./session-presets";
 import type { ToolRegistration } from "./tool-registry";
-import { canInvokeSkill, renderSkillContent } from "./skills";
+import { canInvokeSkill, explicitlyLoadedSkill, renderSkillContent } from "./skills";
 
 const string = { type: "string" }, id = z.string().uuid();
 const targetInput = z.union([scheduleInput.shape.target.removeDefault(), z.enum(["this_session", "new_once", "new"])]);
@@ -23,11 +23,13 @@ const skillsAvailable: NonNullable<ToolRegistration["available"]> = ({ store, ru
   skillDiscovery ? skillDiscovery.complete === false || skillDiscovery.entries.some(({ entry }) => canInvokeSkill(entry, preset?.skills, "model"))
     : Boolean(store.skills?.catalog(run.projectId, preset?.skills, "model").length);
 const skillTool: ToolRegistration = {
-  schema: tool("skill", "按名称加载已列出的 Skills 正文。读取技能目录中的参考文本时传 resource 相对路径。", { name: string, resource: string }, ["name"]),
+  schema: tool("skill", "在任务点名或明显匹配目录条目时，先按名称加载技能正文。用户 /名称 已注入的正文直接使用。需要参考文本时传 resource 相对路径。", { name: string, resource: string }, ["name"]),
   available: skillsAvailable,
   label: "读取技能", mode: "parallel",
   async execute({ store, run, preset, skillDiscovery, signal }, _id, args) {
     const { name, resource } = z.strictObject({ name: skillName, resource: z.string().max(500).optional() }).parse(args);
+    if (resource === undefined && explicitlyLoadedSkill(run.payload.agent?.messages ?? [], name))
+      return { result: { name, already_loaded: true, message: "用户已加载此技能。请使用当前对话中的技能正文。" } };
     const available = skillDiscovery ?? await store.skills!.discover(run.projectId, [], run.payload.childExecution?.cwd ?? run.payload.workingDirectory, [], signal);
     const skill = available.entries.find(({ entry }) => entry.name === name && canInvokeSkill(entry, preset?.skills, "model"));
     if (!skill) throw new AppError("当前对话不能调用该技能", 403, "SKILL_UNAVAILABLE");

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import { Context } from "@deepseek-ai/cordis";
-import { LlmAdapter, ToolCallId, createAssistantMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
+import { HarnessError, LlmAdapter, ToolCallId, createAssistantMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { mountAgentLoopTestDependencies, mountAgentLoopTestHarness } from "@deepseek-ai/dsh-agent-loop-testkit";
 import AgentLoop from "@deepseek-ai/dsh-agent-loop";
@@ -28,6 +28,7 @@ import { DeepSeekFileStore, DeepSeekUploadIndex } from "@deepseek-ai/dsh-llm-dee
 import { LocalSpillStore } from "@deepseek-ai/dsh-spill-local";
 import LocalFileSystem from "@deepseek-ai/dsh-fs-local";
 import * as ToolFs from "@deepseek-ai/dsh-tool-fs";
+import { delegationParityProbe, innerFlowProbe, probeJobCapacity } from "./recovery-cases.mjs";
 import {
   authorizationCases, childPrompt, childTool, currentPrompt, earlierPrompt, earlierReply, firstDelta,
   imageTransportFixture, messagesHistory, messagesResponse, mixedArguments, overflowCases, peerMessage, peerReply, prunableReceipt, recentReceipt, requestReplay, secondDelta, shortenedHistory,
@@ -589,6 +590,210 @@ async function nestedDelegation() {
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
+async function nestedNames() {
+  const { names, leaf } = delegationParityProbe;
+  const root = await mkdtemp(join(tmpdir(), "harness-nested-names-"));
+  const release = Promise.withResolvers();
+  try {
+    return await withLoop((ctx) => mountSubagents(ctx, root), async (ctx, loop) => {
+      ctx.llm.registerAdapter(["mock"], new Adapter(async function* () { await release.promise; yield* reply("done"); }));
+      const lead = await loop.create(SessionId("nested-names"), options), signal = AbortSignal.timeout(5_000);
+      const spawn = (parent, name) => ctx.subagents.startActivation({
+        provider: "spawn", label: name, name, prompt: blocks(name), parent, signal, delivery: "caller", maxDepth: 2,
+      });
+      try {
+        const branches = await Promise.all(names.map((name) => spawn(lead, name)));
+        const parents = branches.map(({ childId }) => ctx.agents.get(childId));
+        const children = await Promise.all(parents.map((parent) => spawn(parent, leaf)));
+        const addresses = names.map((name) => name + "/" + leaf);
+        const resolves = await Promise.all(addresses.map(async (address, i) =>
+          await ctx.subagents.resolveName(lead, address, signal) === children[i].childId));
+        const siblingDuplicate = await spawn(parents[0], leaf).then(() => false, (error) => error.code);
+        const invalidPath = await ctx.subagents.resolveName(lead, "missing/" + leaf, signal).then(() => false, (error) => error.code);
+        const [sender, recipient] = children.map(({ childId }) => ctx.agents.get(childId));
+        await ctx.subagents.sendMessage(sender, recipient.id, blocks(peerMessage), { signal });
+        const senderIdentified = recipient.inbox.nextStep.some((message) => plain(message).includes("Agent " + addresses[0] + " sent a message: " + peerMessage));
+        assert.ok(senderIdentified);
+        return { addresses, resolves, siblingDuplicate, invalidPath,
+          senderIdentified, parentIdentified: ctx.subagents.namesOf(recipient).parent === names[1],
+          bareLeafIsNotAChild: await ctx.subagents.resolveName(lead, leaf, signal) === leaf };
+      } finally { release.resolve(); }
+    });
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+async function consecutiveInputWaits() {
+  const { message, invalid, timeout, calls } = innerFlowProbe.wait;
+  const signal = AbortSignal.timeout(3_000);
+  const root = await mkdtemp(join(tmpdir(), "harness-input-waits-"));
+  try { return await withLoop(async (ctx) => {
+    await mountSubagents(ctx, root);
+    await ctx.plugin(SubagentControl);
+  }, async (ctx, loop) => {
+    let steps = 0, nextInput;
+    ctx.llm.registerAdapter(["mock"], new Adapter(async function* (request) {
+      if (!steps++) {
+        yield* childCalls([{ id: "invalid", name: "wait_agent", args: { timeout_ms: invalid } },
+          ...calls.map((id) => ({ id, name: "wait_agent", args: { timeout_ms: timeout } }))]);
+        return;
+      }
+      nextInput = request.messages.filter((entry) => plain(entry) === message).length;
+      yield* reply("settled");
+    }));
+    const agent = await loop.create(SessionId("two-waits"), options);
+    const events = () => agent.session.snapshotEvents();
+    const admitted = (id) => events().some((event) => event.type === "tool/call" && event.data.callId === id);
+    const settled = () => events().filter((event) => event.type === "tool/result");
+    const waitUntil = async (predicate) => {
+      while (!predicate()) await delay(5, undefined, { signal });
+    };
+    agent.followup(user("wait twice"));
+    await waitUntil(() => admitted(calls[0]));
+    agent.inject(user(message));
+    await waitUntil(() => settled().length === 3);
+    await agent.whenIdle();
+    const [rejected, ...receipts] = settled();
+    return { invalid: rejected.data.error?.code, receipts: receipts.map(({ data }) => JSON.parse(plain(data.message)).timedOut), nextInput };
+  }); } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+async function isolatedToolFailure() {
+  const probe = innerFlowProbe.tool;
+  return withLoop(async () => {}, async (ctx, loop) => {
+    let steps = 0, written = "";
+    ctx.tools.register(defineContentToolFixture({ name: "media_fixture", description: "test authorization", parameters: {},
+      async execute() { throw new HarnessError("missing media credentials", probe.code); } }));
+    ctx.tools.register(defineContentToolFixture({ name: "write_fixture", description: "write draft", parameters: {},
+      async execute() { written = probe.text; return blocks(written); } }));
+    ctx.llm.registerAdapter(["mock"], new Adapter(async function* () {
+      if (!steps++) yield* childCalls([{ id: probe.unavailable, name: "media_fixture", args: {} }, { id: probe.write, name: "write_fixture", args: {} }]);
+      else yield* reply("draft ready");
+    }));
+    const agent = await loop.create(SessionId("media-failure"), options);
+    agent.followup(user("write the draft and try the optional media"));
+    await agent.whenIdle();
+    const events = agent.session.snapshotEvents(), receipts = events.filter(({ type }) => type === "tool/result");
+    return { failure: receipts[0]?.data.error?.code, written, replied: events.some(({ type, data }) => type === "assistant/message" && plain(data.message) === "draft ready") };
+  });
+}
+
+async function interruptDescendant() {
+  const probe = innerFlowProbe.control, root = await mkdtemp(join(tmpdir(), "harness-interrupt-path-"));
+  const release = Promise.withResolvers(), signal = AbortSignal.timeout(5_000);
+  try {
+    return await withLoop(async (ctx) => {
+      await mountSubagents(ctx, root);
+      await ctx.plugin(SubagentControl);
+    }, async (ctx, loop) => {
+      const continued = Promise.withResolvers();
+      ctx.llm.registerAdapter(["mock"], new Adapter(async function* (request) {
+        if (request.messages.some((message) => plain(message).includes(probe.resume))) {
+          continued.resolve();
+          yield* reply(probe.done);
+          return;
+        }
+        await Promise.race([release.promise, delay(5_000, undefined, { signal: request.signal, ref: false })]);
+        yield* reply("fixture settled");
+      }));
+      const lead = await loop.create(SessionId("interrupt-lead"), options);
+      const spawn = (parent, name) => ctx.subagents.startActivation({
+        provider: "spawn", label: name, name, prompt: blocks(name), parent, signal, delivery: "caller", maxDepth: 2,
+      });
+      try {
+        const a = await spawn(lead, probe.a), b = await spawn(lead, probe.b);
+        const aAgent = ctx.agents.get(a.childId), bAgent = ctx.agents.get(b.childId);
+        const leaf = await spawn(aAgent, probe.leaf);
+        const stop = (agent, target) => executeToolFixture(ctx, { agent, signal, callId: ToolCallId(crypto.randomUUID()),
+          name: "interrupt_agent", arguments: { agent: target } });
+        const siblingDenied = (await stop(bAgent, probe.a + "/" + probe.leaf)).isError;
+        const interrupted = await stop(lead, probe.a);
+        const stopped = (await a.result).stopReason === "aborted";
+        const descendant = ctx.agents.get(leaf.childId);
+        const deeperKeptRunning = Boolean(descendant && descendant.status !== "idle");
+        await ctx.subagents.sendMessage(lead, await ctx.subagents.resolveName(lead, probe.a, signal), blocks(probe.resume), { signal });
+        await Promise.race([continued.promise, delay(3_000, undefined, { signal, ref: false }).then(() => assert.fail("Child did not continue"))]);
+        const sameChild = await ctx.subagents.resolveName(lead, probe.a, signal) === a.childId;
+        const trace = { siblingDenied, stopped: stopped && !interrupted.isError, deeperKeptRunning, sameChild };
+        assert.ok(Object.values(trace).every(Boolean));
+        return trace;
+      } finally { release.resolve(); }
+    });
+  } finally { await rm(root, { recursive: true, force: true }); }
+}
+
+async function childReasoning() {
+  const { route, parentEffort, explicitEffort, configuredEffort } = delegationParityProbe;
+  const { requestedAgentOptions, preflightChildLlmRoute } = await import(pathToFileURL(join(process.cwd(),
+    "packages/subagent/tool-subagent/src/model-selection.ts")).href);
+  const parent = { ...route, reasoningEffort: parentEffort }, config = { ...route, reasoningEffort: configuredEffort };
+  return withLoop(async () => {}, async (ctx) => {
+    class ReasoningAdapter extends Adapter {
+      async resolveModel(provider, model) {
+        return { ...await super.resolveModel(provider, model), reasoning: {
+          efforts: ["off", parentEffort, explicitEffort].map((id) => ({ id, name: id })), defaultEffort: parentEffort,
+        } };
+      }
+    }
+    ctx.llm.registerAdapter([route.provider], new ReasoningAdapter(reply));
+    assert.deepEqual(await ctx.llm.listModels(route.provider), []);
+    const resolved = [];
+    const llm = { async resolveCallConfig(request, signal) {
+      resolved.push(request.reasoningEffort ?? null);
+      return ctx.llm.resolveCallConfig(request, signal);
+    } };
+    const run = async (request, configured?) => {
+      const selected = requestedAgentOptions(configured, request, true, undefined, parent);
+      await preflightChildLlmRoute(llm, parent, selected, AbortSignal.timeout(3_000), !request.provider);
+    };
+    await assert.rejects(run({ reasoning_effort: explicitEffort }), /requires both/);
+    await run({});
+    await run(route);
+    await run({ ...route, reasoning_effort: explicitEffort });
+    await run({}, config);
+    await run(route, config);
+    await run({ ...route, reasoning_effort: "off" });
+    return { effortOnlyRejected: true, resolved };
+  });
+}
+
+async function jobOwners() {
+  const { log, limit, names } = delegationParityProbe;
+  return withLoop(async (ctx) => {
+    await ctx.plugin(LocalJobRegistry);
+    await ctx.plugin(ToolJobs, { completionDelivery: "quiet" });
+  }, async (ctx, loop) => {
+    const lead = await loop.create(SessionId("jobs-lead"), options);
+    const actors = new Map(await Promise.all(names.map(async (name) => [name, await loop.create(SessionId("jobs-" + name), options)])));
+    const active = new Map();
+    const start = async (owner, label) => {
+      const done = Promise.withResolvers();
+      const id = ctx.jobs.start({ kind: "test", label: String(label), owner: actors.get(owner).id, run(job) {
+        job.append(log + "\n");
+        return { cancel() {}, done: done.promise };
+      } });
+      active.set(id, { done, owner: actors.get(owner) });
+      return id;
+    };
+    const finish = async (id) => {
+      const { done, owner } = active.get(id);
+      done.resolve({ status: "completed", result: "ready" });
+      await ctx.jobs.wait(id, 3_000, owner.id);
+      active.delete(id);
+    };
+    try {
+      const id = await start("a", "owned");
+      const read = (actor, wait = false) => executeToolFixture(ctx, { agent: actor, signal: AbortSignal.timeout(3_000),
+        callId: ToolCallId(crypto.randomUUID()), name: "job_output", arguments: { job_id: id, wait, timeout_ms: 10 } });
+      const trace = { owner: (await read(actors.get("a"))).value.text.includes(log),
+        lead: (await read(lead)).error?.info?.code, peerWait: (await read(actors.get("b"), true)).error?.info?.code };
+      await finish(id);
+      return { trace, capacity: await probeJobCapacity(start, (job) => {
+        assert.equal(ctx.jobs.kill(job, active.get(job).owner.id), "requested");
+      }, finish, limit) };
+    } finally { for (const id of active.keys()) await finish(id); }
+  });
+}
+
 async function crossTurnCollaboration() {
   const root = await mkdtemp(join(tmpdir(), "harness-cross-turn-"));
   const startedChild = Promise.withResolvers(), releaseChild = Promise.withResolvers();
@@ -1027,6 +1232,14 @@ export async function referenceRecoveryScenarios() {
   result["team mode and task transitions match the reference"] = await teamBoard();
   result["parallel delegation keeps distinct children and honors the nesting cap"] = await nestedDelegation();
   result["named child addresses reject duplicate sibling names"] = await namedChild();
+  const delegation = delegationParityProbe.cases, jobs = await jobOwners();
+  result[delegation.reasoning] = await childReasoning();
+  result[delegation.names] = await nestedNames();
+  result[delegation.output] = jobs.trace;
+  result[delegation.capacity] = jobs.capacity;
+  result[innerFlowProbe.wait.case] = await consecutiveInputWaits();
+  result[innerFlowProbe.tool.case] = await isolatedToolFailure();
+  result[innerFlowProbe.control.case] = await interruptDescendant();
   const crossTurn = await crossTurnCollaboration();
   for (const [key, name] of Object.entries(crossTurnProbe.cases)) result[name] = crossTurn[key];
   for (const scenario of childNoticeProbe.cases) result[scenario.name] = await childCompletionNotice(scenario);

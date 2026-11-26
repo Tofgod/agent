@@ -126,7 +126,6 @@ export const resolveLiveDeepSeekModel: TextModelResolver = async (settings, sign
   const capabilities = await deepSeekCatalogCapabilities(settings);
   signal.throwIfAborted();
   if (capabilities.unauthorized) throw new AppError("DeepSeek 未接受当前线路的凭据", 409, "MODEL_NOT_CONFIGURED");
-  if (capabilities.listed === false) throw new AppError("当前 DeepSeek 线路未列出该模型", 409, "MODEL_ROUTE_UNAVAILABLE");
   return { ...model, ...(capabilities.imageInput !== undefined ? { inputModalities: capabilities.imageInput ? ["text", "image"] : ["text"] } : {}),
     ...(capabilities.efforts ? { efforts: capabilities.efforts } : {}) };
 };

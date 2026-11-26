@@ -3,7 +3,7 @@ import { readSelection, resolveReadFile, tool } from "./file-tools";
 import { inspectImage } from "./images";
 import { projectOutputPath, projectRelativePath } from "./project-layout";
 import { imageProvider, mediaBaseUrl, requireMedia } from "./providers";
-import { OMNI_TASK_TYPES, isVideoReferenceUrl, videoCapabilities, videoDurationLimits, videoOptions, videoProvider, videoRequestOptions } from "./video-input";
+import { H3_MAX_PROMPT_EXPANSION, OMNI_TASK_TYPES, isVideoReferenceUrl, videoCapabilities, videoDurationLimits, videoOptions, videoProvider, videoRequestOptions } from "./video-input";
 import { COMPOSITION_FPS, COMPOSITION_RESOLUTIONS, MEDIA_RATIOS, VIDEO_RATIOS, imageOptions, imageRequestOptions, isSeedream55 } from "./media-specs";
 import type { ProviderSettings, VideoReferenceSource, VideoReferences } from "./types";
 import { AppError } from "./security";
@@ -37,14 +37,16 @@ const videoInput = commonInput.extend({
 const bool = { type: "boolean" };
 
 function videoSchema(settings: ProviderSettings) {
-  const { seedance, v25, resolutions, imageLimit, otherLimit } = videoCapabilities(settings.videoModel);
-  const { min, max } = videoDurationLimits(settings.videoModel);
+  const model = settings.videoModel;
+  const { seedance, v25, resolutions, imageLimit, otherLimit } = videoCapabilities(model);
+  const { min, max } = videoDurationLimits(model);
+  const range = { minimum: min, maximum: max };
   const duration = `整数秒 ${min}–${max}` + (seedance ? "，-1 或省略为自动。" : "。") + (v25 ? "编辑必须为 -1，使用样片续做时省略。" : "");
-  const ratioHint = (v25 ? "首帧/首尾帧、视频编辑和延长自动沿用输入画幅。" : !seedance
-    ? "图生视频沿用参考帧画幅，文生视频使用具体宽高比。" : "adaptive 根据输入自动确定画幅。") + "其他模式未指定时沿用项目比例。";
-  return tool("generate_video", "提交后台视频生成。可用提示词直出、参考帧或多素材参考。参考视频需要供应商能访问的公网链接。返回任务编号；本轮需要成品时用 job_output（wait=true）。", {
+  const ratioHint = !seedance ? "图生视频沿用参考帧画幅，文生视频使用具体宽高比（默认项目比例），多模态参考默认 adaptive。" :
+    (v25 ? "首帧/首尾帧、视频编辑和延长自动沿用输入画幅。" : "adaptive 根据输入自动确定画幅。") + "其他模式未指定时沿用项目比例。";
+  return tool("generate_video", `用当前视频模型 ${model} 提交后台生成，单次支持 ${min}–${max} 秒。可用提示词直出、参考帧或多素材参考。参考视频需要供应商能访问的公网链接。返回任务编号；本轮需要成品时用 job_output（wait=true）。`, {
     ...file, image_path: { ...string, description: "项目首帧图片路径" }, last_image_path: { ...string, description: seedance ? "项目尾帧图片路径，须搭配首帧" : "项目尾帧图片路径" },
-    prompt: string, duration: { type: "integer", description: duration }, dialogue: string,
+    prompt: string, duration: { type: "integer", description: duration, ...(seedance ? { anyOf: [{ const: -1 }, range] } : range) }, dialogue: string,
     ratio: { ...ratio, enum: VIDEO_RATIOS, description: ratioHint },
     resolution: { ...string, enum: resolutions, description: "视频输出分辨率" }, generate_audio: bool, reference_versions: versions,
     reference_paths: { ...paths, maxItems: imageLimit, description: "多素材参考中的项目图片路径。" },
@@ -66,6 +68,9 @@ function videoSchema(settings: ProviderSettings) {
       omni_reference_task_type: { ...string, enum: OMNI_TASK_TYPES, description: "auto 自动，reference 参考生成，edit 编辑，extend 延长" },
       draft: { ...bool, description: "生成 480p 样片" }, draft_video_path: { ...string, description: "用本项目同线路的 480p 样片生成 1080p 或 4k 正式视频，继承样片的提示词、素材、时长、画幅和音频" },
     } : {}),
+    ...(model === "MiniMax-H3-Max" ? { extra: { type: "object", additionalProperties: false, properties: {
+      prompt_expansion_mode: { ...string, enum: H3_MAX_PROMPT_EXPANSION, description: "提示词扩写。disabled 关闭，balanced 均衡（默认），quality 质量优先。" },
+    } } } : {}),
   }, seedance ? ["file_path"] : ["file_path", "duration", "prompt"]);
 }
 function generationTool(image: boolean): ToolRegistration {

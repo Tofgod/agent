@@ -49,7 +49,7 @@ export async function executeToolGroup(store: Store, run: Run, registry: ToolReg
           await store.commitReadReceipt(run, call.id, toolAborted).catch(() => {});
         if (execution.signal.aborted && error instanceof Error && !(error instanceof AppError) &&
           (error === execution.signal.reason || error.name === "AbortError")) throw execution.signal.reason;
-        if (error instanceof AppError && ["RUN_STOPPED", "AGENT_STEER", "MEDIA_NOT_CONFIGURED"].includes(error.code)) throw error;
+        if (error instanceof AppError && ["RUN_STOPPED", "AGENT_STEER"].includes(error.code)) throw error;
         const failure = toolFailure(error);
         if (parallel || !dispatched && !["UNKNOWN_TOOL", "TOOL_DENIED", "TOOL_CANCELLED"].includes(failure.result.code)) return failure;
         return project(prepared, failure);

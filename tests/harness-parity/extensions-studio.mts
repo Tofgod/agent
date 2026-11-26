@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { mcpAdmissionCases, mcpAdmissionServer } from "./extension-cases.mjs";
+import { scheduleWakeProbe } from "./extension-cases.mjs";
+import { observeSkillCatalog, skillCatalogProbe, skillLookupPrompt, skillPhasePrompt } from "./extension-cases.mjs";
+import { observeSkillLifecycle, observeSkillStep, skillLifecycle, skillStepProbe } from "./extension-cases.mjs";
+import { startScheduleDriver } from "../../server/schedule-driver";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -9,6 +13,7 @@ import { advanceRun } from "../../lib/studio/engine";
 import { McpManager, MCP_STARTUP_TIMEOUT_MS } from "../../lib/studio/mcp";
 import { PresetPlugins } from "../../lib/studio/preset-plugins";
 import { AppError } from "../../lib/studio/security";
+import { ModelRequestError } from "../../lib/studio/providers";
 import { tool } from "../../lib/studio/file-tools";
 import { Schedules } from "../../lib/studio/schedules";
 import { SkillLibrary } from "../../lib/studio/skills";
@@ -40,8 +45,168 @@ async function finish(store, project, runId, model) {
   assert.fail("do漫 fixture did not settle");
 }
 
-async function studioAlignment(db, manager, library, store, project) {
+async function studioSkillCatalog(db, manager, library) {
+  const probe = skillCatalogProbe, trace = [];
+  let current = probe.phases[0], invalidate = () => {}, reads = 0;
+  const plugin = {
+    id: "skill-probe", name: "Skill catalog fixture", setup(host) {
+      host.registerExecutionHooks({ preStep: () => current.action === "veto" ? { kind: "reject", reason: "fixture rejects input" } : undefined });
+      host.registerSkillProvider((context) => {
+        invalidate = context.invalidate;
+        const entry = (name, description, modelInvocable) => ({ name, description, modelInvocable, provider: "fixture", read() {
+          reads++;
+          return name === probe.manual ? probe.manualBody :
+            current.action === "direct" ? probe.direct : current.action === "load" ? probe.edited : probe.original;
+        } });
+        return { complete: current.complete !== false, candidates: [
+          ...(current.installed ? [entry(probe.skill, current.renamed ? probe.renamed : probe.description, true)] : []),
+          entry(probe.manual, "Manual invocation", false),
+        ] };
+      });
+    },
+  };
+  const presetPlugins = new PresetPlugins(db, manager, [plugin]);
+  await presetPlugins.start("local", [plugin.id]);
+  try {
+    const store = new Store(db, { skills: library, presetPlugins });
+    let project = await store.createProject("local", {});
+    for (const phase of probe.phases) {
+      current = phase;
+      invalidate();
+      if (phase.id === "unrelated-update") project = await store.updateProject(project.id, "local", { title: "Updated project state" });
+      let observed, modelStep = 0;
+      await finish(store, project, await send(store, project, skillPhasePrompt(probe, phase)), async (_system, messages, tools) => {
+        assert.notEqual(current.action, "veto");
+        const catalog = observeSkillCatalog(messages.map(({ source }) => source));
+        const bodyBlocks = messages.filter(({ source }) => source?.kind === "skill-invocation").map(({ content }) => content);
+        const currentCatalog = messages.findLast(({ source }) => source?.kind === "skill-catalog");
+        assert.ok(!messages.some(({ source }) => source?.kind === "runtime-context" && source.sections.some(({ name }) => name === "skills")));
+        if (current.action === "load" && modelStep++ === 0) {
+          assert.equal(reads, 0);
+          assert.ok(tools.some(({ function: definition }) => definition.name === "skill"));
+          return callTool("catalog-load", "skill", { name: probe.skill });
+        }
+        const receipt = messages.findLast(({ tool_call_id }) => tool_call_id === "catalog-load");
+        observed = { ...catalog, body: current.action === "load" ? (receipt?.content.includes(probe.edited) ? probe.edited : "") :
+          current.action === "direct" ? bodyBlocks.filter((block) => block.includes(probe.direct)).length :
+          current.action === "manual" ? bodyBlocks.filter((block) => block.includes(probe.manualBody)).length : "",
+        reuse: current.action === "direct" && Boolean(currentCatalog?.content.includes("不要再用 skill 读取同一份正文")) };
+        return responseText("finished");
+      });
+      trace.push({ phase: phase.id, ...observed, reads });
+    }
+    return trace;
+  } finally { await presetPlugins.close(); }
+}
+
+async function studioSkillSteps(db, manager, library) {
+  const probe = skillStepProbe, trace = [];
+  let description = "Initial description", reads = 0, invalidate = () => {}, phase;
+  const change = (value) => { description = value; invalidate(); };
+  const plugin = { id: "skill-steps", name: "Skill step fixture", setup(host) {
+    host.registerSkillProvider((context) => {
+      invalidate = context.invalidate;
+      return [{ name: probe.skill, description, read() { reads++; return probe.body; } }];
+    });
+    host.registerExecutionHooks({
+      preStep({ messages }) {
+        if (phase.admittedDescription) change(phase.admittedDescription);
+        if (phase.text) return { kind: "accept", messages: messages.map((message) => message.source || message.role !== "user" ? message :
+          { ...message, content: phase.text, ...(phase.external ? { source: { kind: "tool-context" } } : {}) }) };
+      },
+      requestError({ code }) { return phase.retry && code === "MODEL_AUTH" ? "retry" : undefined; },
+    });
+  } };
+  const plugins = new PresetPlugins(db, manager, [plugin]);
+  await plugins.start("local", [plugin.id]);
+  try {
+    const store = new Store(db, { skills: library, presetPlugins: plugins }), project = await store.createProject("local", {});
+    for (phase of probe.phases) {
+      const requests = [];
+      await finish(store, project, await send(store, project, phase.input), async (_system, messages) => {
+        requests.push(observeSkillStep(messages.map(({ source }) => source), reads));
+        if (requests.length === 1 && phase.nextDescription) change(phase.nextDescription);
+        if (requests.length === 1 && phase.tool) return callTool("catalog-barrier", "list_files", {});
+        if (requests.length === 1 && phase.retry) throw new ModelRequestError("Fixture retry", 401, "MODEL_AUTH");
+        return responseText("Completed");
+      });
+      trace.push({ phase: phase.id, requests });
+    }
+    return trace;
+  } finally { await plugins.close(); }
+}
+
+async function studioSkillLifecycle(root) {
+  const probe = skillLifecycle, trace = {};
+  const filename = join(root, "skill-lifecycle.sqlite");
+  let reads = 0, restarted = false, project;
+  const useStore = async (work) => {
+    const db = new SQLiteDatabase(filename);
+    db.initialize("drizzle");
+    const library = new SkillLibrary(join(root, "lifecycle-skills"));
+    const manager = new McpManager(db, "skill-lifecycle-fixture".repeat(3));
+    const plugins = new PresetPlugins(db, manager, ["first", "second"].map((preset) => ({ id: preset, name: preset, setup(host) {
+      const first = preset === "first";
+      host.registerSkillProvider(() => [probe.shared, first ? probe.firstOnly : probe.secondOnly].map((name) => ({ name,
+        description: name === probe.shared ? (first ? "First" : "Second") : restarted ? "Updated after restart" : "Preset entry",
+        read() { reads++; return first ? probe.before : restarted ? probe.refreshed : probe.after; },
+      })));
+    } })));
+    try { await work(new Store(db, { skills: library, presetPlugins: plugins }), library, plugins); }
+    finally { await plugins.close(); await manager.close(); library.close(); db.close(); }
+  };
+  const ask = async (store, phase, prompt) => finish(store, project, await send(store, project, prompt), async (_system, messages) => {
+    if (phase) trace[phase] = observeSkillLifecycle(messages.map(({ source }) => source),
+      messages.filter(({ source }) => source?.kind === "skill-invocation").map(({ content }) => content), reads);
+    return responseText("Completed");
+  });
+  await useStore(async (store, library, plugins) => {
+    project = await store.createProject("local", {});
+    const makePreset = (name) => store.presets.save("local", { name, instructions: "", plugins: [name] });
+    const first = await makePreset("first"), second = await makePreset("second");
+    await store.presets.select("local", project.id, "", first.id);
+    const scope = await plugins.acquire("local", first);
+    try { trace.warm = (await library.discover(project.id, scope.providers, undefined, scope.scopedProviders)).entries.map(({ entry }) => entry.name).sort(); }
+    finally { await scope.release(); }
+    await store.presets.select("local", project.id, "", second.id);
+    await ask(store, "selected", probe.initial);
+    await ask(store, "invoked", probe.invocation);
+    await ask(store, "", probe.older); await ask(store, "", probe.recent);
+    const compact = crypto.randomUUID();
+    await store.requestCompaction(project.id, compact);
+    let summarized = false;
+    await finish(store, project, compact, async (_system, messages) => {
+      assert.ok(messages.some(({ content }) => content === probe.older));
+      assert.ok(!messages.some(({ source }) => source?.kind === "skill-catalog"));
+      summarized = true;
+      return responseText(probe.summary);
+    });
+    assert.ok(summarized);
+    await ask(store, "compacted", probe.initial);
+  });
+  restarted = true;
+  await useStore(async (store) => {
+    await ask(store, "restarted", probe.initial);
+    await ask(store, "reinvoked", probe.invocation);
+    await ask(store, "unchanged", probe.initial);
+    const first = store.presets.list("local").find(({ name }) => name === "first");
+    await store.presets.select("local", project.id, "", first.id);
+    await finish(store, project, await send(store, project, probe.invocation), async (_system, messages) => {
+      const result = observeSkillLifecycle(messages.map(({ source }) => source),
+        messages.filter(({ source }) => source?.kind === "skill-invocation").map(({ content }) => content), reads);
+      assert.deepEqual(result.entries.map(([name]) => name), [probe.firstOnly, probe.shared]);
+      assert.equal(result.blocks.at(-1), probe.before);
+      assert.equal(result.reads, 3);
+      return responseText("Completed");
+    });
+  });
+  return trace;
+}
+
+async function studioAlignment(db, manager, library, store, project, root) {
   const result = {};
+  result[skillLifecycle.name] = await studioSkillLifecycle(root);
+  result[skillStepProbe.name] = await studioSkillSteps(db, manager, library);
   const zip = await new Response(projectArchive(store, project.id, undefined)).arrayBuffer();
   const imported = await restoreProjectArchive(store, "local", zip, undefined, new AbortController().signal);
   const followup = await send(store, imported, resumePrompt);
@@ -109,16 +274,20 @@ async function studioAlignment(db, manager, library, store, project) {
   const skilled = new Store(db, { skills: library });
   const skillRun = await send(skilled, skillProject, skillGesture);
   const skill = { direct: "", tool: "", large: library.load(skillProject.id, "large-skill", null, "model").length };
-  let skillStep = 0;
   await finish(skilled, skillProject, skillRun, async (_system, messages) => {
+    skill.direct = normalizeSkillBlock(messages.find(({ content }) => content?.startsWith("<skill_content"))?.content ?? "");
+    return responseText("direct skill read");
+  });
+  let skillStep = 0;
+  await finish(skilled, skillProject, await send(skilled, skillProject, skillLookupPrompt), async (_system, messages) => {
     if (skillStep++ === 0) {
-      skill.direct = normalizeSkillBlock(messages.find(({ content }) => content?.startsWith("<skill_content"))?.content ?? "");
       return callTool("skill-load", "skill", { name: "shared-skill" });
     }
     skill.tool = normalizeSkillBlock(messages.find(({ tool_call_id }) => tool_call_id === "skill-load")?.content ?? "");
     return responseText("skill read");
   });
   result["Skills return the same model block from user and tool and read a long source"] = skill;
+  result[skillCatalogProbe.name] = await studioSkillCatalog(db, manager, library);
 
   const probeRow = await manager.save("local", { name: "list-failure", transport: "stdio", command: process.execPath,
     args: ["-e", mcpScript(false, true)], enabled: false, closeTimeoutMs: 1500 });
@@ -185,6 +354,23 @@ async function studioAlignment(db, manager, library, store, project) {
   const scheduled = await store.createProject("local", {});
   const target = await store.createSession(scheduled.id, "Schedule target");
   const scheduler = new Schedules(store);
+  {
+    const { name, later, earlier } = scheduleWakeProbe, errors = [];
+    const timerSession = await store.createSession(scheduled.id, "Timed schedule");
+    const stop = startScheduleDriver(db, scheduler, (error) => errors.push(error));
+    try {
+      const schedule = ({ prompt, ms }) => scheduler.save(scheduled.id, { title: prompt, prompt,
+        timing: { kind: "at", at: new Date(Date.now() + ms).toISOString() }, target: { kind: "session", id: timerSession.id } });
+      const future = await schedule(later), soon = await schedule(earlier);
+      const seen = () => [soon, future].flatMap((task) => scheduler.history(scheduled.id, task.id).rows.map(({ prompt }) => prompt));
+      const quietBeforeDue = seen().length === 0;
+      for (let i = 0; i < 150 && seen().length === 0 && errors.length === 0; i++) await delay(20);
+      assert.deepEqual(errors, []);
+      const delivered = seen();
+      assert.deepEqual(delivered, [earlier.prompt]);
+      result[name] = { quietBeforeDue, seen: delivered, earlierOnly: delivered[0] === earlier.prompt && delivered.length === 1 };
+    } finally { await stop(); }
+  }
   const configuration = { title: scheduleTitle, prompt: schedulePrompt, timing: scheduleTimingFixture, target: { kind: "session", id: target.id } };
   let task = await scheduler.save(scheduled.id, configuration);
   await finish(store, scheduled, await send(store, scheduled, "Prime", target.id), async () => responseText("ready"));
@@ -395,7 +581,7 @@ export async function studioExtensions() {
     return { "Skills project precedence and YAML": skills, "MCP stable names and cursor paging": mcp,
       "Skills nearest scope wins before numeric rank": shadow, "MCP startup budget and atomic image rejection": mcpBatch,
       "Fork at a committed request context excludes future messages": widerFork,
-      ...schedules, "Fork before dispatch, after dispatch and after settlement": fork, ...await studioAlignment(db, manager, library, store, project) };
+      ...schedules, "Fork before dispatch, after dispatch and after settlement": fork, ...await studioAlignment(db, manager, library, store, project, root) };
   } finally {
     library.close();
     await manager.close();

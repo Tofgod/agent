@@ -643,6 +643,48 @@ test("job output is incremental, replay-safe, and independent from the observati
   } finally { (store.db as SQLiteDatabase).close(); }
 });
 
+test("a reopened conversation keeps its lead's job capacity and cursor across turns and resume", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "doman-job-admission-"));
+  const filename = path.join(directory, "studio.sqlite");
+  let db = new SQLiteDatabase(filename);
+  const reopen = () => new Store(db, { maxConcurrentJobsPerOwner: 1, completionDelivery: "quiet" });
+  try {
+    db.initialize("drizzle");
+    let store = reopen();
+    const project = await store.createProject("alice", {});
+    const claim = async (id: string) => {
+      assert.ok(await store.claimRun(id, project.id));
+      return store.run(id, project.id);
+    };
+    const create = async (owner: Run, name: string) => String((await store.startChild(owner, name, "media", name, {
+      stage: "composing", background: true, payload: { instruction: "", sourceVersions: {},
+        operation: { toolCallId: name, name: "compose_video", path: "/07_成片/" + name + ".mp4" } },
+    })).task_id);
+    const first = await claim((await send(store, project, "First turn")).id);
+    const job = await claim(await create(first, "first"));
+    await store.appendBackgroundOutput(job, ["before"], "lines");
+    assert.match(String((await consumeJobOutput(store, first, "read-first", job.id)).text), /before/);
+    await store.appendBackgroundOutput(job, ["after"], "lines");
+    await store.releaseLease(job);
+    await store.updateRun(first, { status: "done", stage: "done" });
+    db.close();
+    db = new SQLiteDatabase(filename);
+    store = reopen();
+
+    const next = await claim((await send(store, project, "Second turn")).id);
+    assert.match(String((await consumeJobOutput(store, next, "read-next", job.id)).text), /after/);
+    assert.equal((await consumeJobOutput(store, next, "again", job.id)).text, "");
+    await assert.rejects(create(next, "second"), { code: "JOB_LIMIT_REACHED" });
+    await store.controlTree(await store.run(job.id, project.id), "pause");
+    const second = await create(next, "second");
+    const paused = await store.run(job.id, project.id);
+    await assert.rejects(store.resumeTree(paused, paused.payload), { code: "JOB_LIMIT_REACHED" });
+    await store.controlTree(await store.run(second, project.id), "cancel");
+    await store.resumeTree(paused, paused.payload);
+    assert.equal((await store.run(job.id, project.id)).status, "queued");
+  } finally { db.close(); await rm(directory, { recursive: true, force: true }); }
+});
+
 test("nested delegation survives recovery, enforces depth and allocates sibling names concurrently", async () => {
   const initial = fixture(), project = await initial.createProject("alice", {});
   const store = new Store(initial.db, { maxDelegationDepth: 2 });
@@ -739,15 +781,17 @@ test("a result delivered by the previous notice format does not hide unread logs
   } finally { (store.db as SQLiteDatabase).close(); }
 });
 
-test("delegated DeepSeek effort inherits on the same route, resets on switch and obeys explicit overrides", async (t) => {
+test("delegated DeepSeek effort inherits implicitly and takes explicit overrides only with a route", async (t) => {
   const { childExecution, preflightChildModel } = await import("../lib/studio/child-execution");
   const { createAgentModel } = await import("../lib/studio/providers");
   const parent = { ...settings, textThinking: true, textReasoningEffort: "high" as const };
   const messagesRoute = { provider: "messages" as const, model: "deepseek-flash" as const };
   assert.equal(childExecution({}, parent).route.effort, "high");
   assert.equal(childExecution(messagesRoute, parent).route.effort, undefined);
+  assert.equal(childExecution({ provider: "chat-completions", model: "deepseek-flash" }, parent).route.effort, undefined);
   assert.equal(childExecution({ ...messagesRoute, reasoning_effort: "max" }, parent).route.effort, "max");
-  await assert.rejects(preflightChildModel(childExecution({ reasoning_effort: "max" }, parent), parent, AbortSignal.timeout(500),
+  assert.throws(() => childExecution({ reasoning_effort: "max" }, parent), { code: "INVALID_ARGS" });
+  await assert.rejects(preflightChildModel(childExecution({ ...messagesRoute, reasoning_effort: "max" }, parent), parent, AbortSignal.timeout(500),
     async () => ({ id: "deepseek-flash", thinking: [true], inputModalities: ["text"], efforts: ["low", "high"] })),
     (error) => error instanceof AppError && error.code === "AGENT_ROUTE_UNAVAILABLE");
 

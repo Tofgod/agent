@@ -5,6 +5,11 @@ import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { Context } from "@deepseek-ai/cordis";
+import Loader from "@deepseek-ai/cordis-plugin-loader";
+import Group from "@deepseek-ai/cordis-plugin-group";
+import AgentPresets from "@deepseek-ai/dsh-agent-preset-registry";
+import TokenMeter from "@deepseek-ai/dsh-token-meter";
+import { BasicCompactionEngine } from "@deepseek-ai/dsh-compaction-basic";
 import { LlmAdapter, LlmError, ToolCallId, createMessage, createToolResultMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 import { createScope, scopeOf } from "@deepseek-ai/dsh-scope";
 import McpServerManager from "@deepseek-ai/dsh-mcp-manager";
@@ -33,6 +38,9 @@ import { cutPrompt, cutToolId, futureReply, mcpScript, mcpServer, scheduleCases,
 import { largeSkillBody, mcpConcurrentRefresh, normalizeSkillBlock, resumePrompt, schedulePrompt, scheduleTimingFixture,
   scheduleTitle, scheduleTitleAfter, settledReply, sharedSkillBody, skillGesture, traceNoise, hooksQuery, hookResult } from "./extension-cases.mjs";
 import { mcpAdmissionCases, mcpAdmissionServer } from "./extension-cases.mjs";
+import { scheduleWakeProbe } from "./extension-cases.mjs";
+import { observeSkillCatalog, skillCatalogProbe, skillLookupPrompt, skillPhasePrompt } from "./extension-cases.mjs";
+import { observeSkillLifecycle, observeSkillStep, skillLifecycle, skillStepProbe } from "./extension-cases.mjs";
 
 const source = (path) => pathToFileURL(join(process.cwd(), path)).href;
 const text = (message) => message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
@@ -44,6 +52,10 @@ class Adapter extends LlmAdapter {
   async resolveModel(provider, model) { return { provider, id: model, name: model }; }
   async *stream(request) {
     const answer = await this.respond(request);
+    if (answer?.failure) {
+      yield { type: "finish", reason: { kind: "error", failure: { code: answer.failure, message: "Fixture retry" } } };
+      return;
+    }
     if (typeof answer === "string") {
       yield { type: "block-start", index: 0, blockType: "text" };
       yield { type: "text-delta", index: 0, text: answer };
@@ -76,8 +88,190 @@ async function until(read, accepted) {
   assert.fail("Harness fixture did not converge: " + JSON.stringify(value));
 }
 
+async function referenceSkillCatalog(root) {
+  const probe = skillCatalogProbe;
+  let current = probe.phases[0], invalidate = () => {}, reads = 0;
+  return withLoop(join(root, "skill-catalog"), async (context) => {
+    await context.plugin(SkillRegistry);
+    context.skills.registerProvider((control) => {
+      invalidate = control.invalidate;
+      const entry = (name, description, modelInvocable) => ({
+        name, description, provider: "fixture", source: "fixture", rank: 1, locator: name, invocation: { modelInvocable, userInvocable: true },
+      });
+      return {
+        name: "fixture",
+        async list() {
+          return { complete: current.complete !== false, candidates: [
+            ...(current.installed ? [entry(probe.skill, current.renamed ? probe.renamed : probe.description, true)] : []),
+            entry(probe.manual, "Manual invocation", false),
+          ] };
+        },
+        async get(candidate) {
+          reads++;
+          const content = candidate.name === probe.manual ? probe.manualBody :
+            current.action === "direct" ? probe.direct : current.action === "load" ? probe.edited : probe.original;
+          return { ...candidate, content };
+        },
+      };
+    });
+    await context.plugin(ToolSkill);
+  }, async (context) => {
+    const trace = [];
+    let modelStep = 0, observed;
+    context.on("agent/pre-step", (_input, next) => current.action === "veto"
+      ? { kind: "reject", reason: "fixture rejects input" } : next());
+    context.llm.registerAdapter([route.provider], new Adapter(({ messages, tools }) => {
+      assert.notEqual(current.action, "veto");
+      const catalog = observeSkillCatalog(messages.map(({ source }) => source));
+      const bodyBlocks = messages.filter(({ source }) => source?.kind === "skill-invocation").map(text);
+      const currentCatalog = messages.findLast(({ source }) => source?.kind === "skill-catalog");
+      if (current.action === "load" && modelStep++ === 0) {
+        assert.equal(reads, 0);
+        assert.ok(tools?.some(({ name }) => name === "skill"));
+        observed = { ...catalog, body: "", reuse: false };
+        return { id: "catalog-load", name: "skill", args: { name: probe.skill } };
+      }
+      const receipt = messages.findLast(({ role, toolCallId }) => role === "tool" && toolCallId === "catalog-load");
+      observed = { ...catalog, body: current.action === "load" ? (receipt && text(receipt).includes(probe.edited) ? probe.edited : "") :
+        current.action === "direct" ? bodyBlocks.filter((block) => block.includes(probe.direct)).length :
+        current.action === "manual" ? bodyBlocks.filter((block) => block.includes(probe.manualBody)).length : "",
+      reuse: current.action === "direct" && Boolean(currentCatalog && text(currentCatalog).includes("do not call the `skill` tool again")) };
+      return "finished";
+    }));
+    const agent = await context.agentLoop.create(SessionId("skill-catalog"), route);
+    for (const phase of probe.phases) {
+      current = phase;
+      observed = undefined;
+      invalidate();
+      agent.followup(user(skillPhasePrompt(probe, phase)));
+      await agent.whenIdle();
+      trace.push({ phase: phase.id, ...observed, reads });
+    }
+    assert.deepEqual(trace.map(({ revisions }) => revisions), [0, 1, 1, 1, 2, 2, 3, 4, 4, undefined, 5, 5]);
+    assert.deepEqual(trace.map(({ reads }) => reads), [0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 3]);
+    assert.equal(trace[8].reuse, true);
+    assert.deepEqual(trace[10].entries, []);
+    return trace;
+  });
+}
+
+async function referenceSkillSteps(root) {
+  const probe = skillStepProbe, trace = [];
+  let description = "Initial description", reads = 0, invalidate = () => {};
+  let phase, requests;
+  const change = (value) => { description = value; invalidate(); };
+  return withLoop(join(root, "skill-steps"), async (ctx) => {
+    await ctx.plugin(SkillRegistry);
+    ctx.skills.registerProvider((control) => {
+      invalidate = control.invalidate;
+      return { name: "fixture", async list() { return [{ name: probe.skill, description, provider: "fixture", source: "fixture",
+        locator: null, rank: 1, invocation: { modelInvocable: true, userInvocable: true } }]; },
+      async get(candidate) { reads++; return { ...candidate, content: probe.body }; } };
+    });
+    ctx.on("agent/pre-step", async (_input, next) => {
+      if (phase.admittedDescription) change(phase.admittedDescription);
+      const decision = await next();
+      if (decision.kind !== "enter") return decision;
+      return !phase.text ? decision : { ...decision, messages: decision.messages.map((message) =>
+        message.source.kind !== "user" ? message : createUserMessage({ content: blocks(phase.text), source: { kind: phase.external ? "tool-context" : "user" } })) };
+    });
+    await ctx.plugin(ToolSkill);
+    ctx.tools.register(defineContentToolFixture({ name: "list_files", description: "List files", parameters: {}, async execute() { return blocks("list"); } }));
+  }, async (ctx) => {
+    ctx.on("agent/request-error", (input, next) => phase.retry && input.failure.code === "AUTH" ? { kind: "retry" } : next());
+    ctx.llm.registerAdapter([route.provider], new Adapter(({ messages }) => {
+      requests.push(observeSkillStep(messages.map(({ source }) => source), reads));
+      if (requests.length === 1 && phase.nextDescription) change(phase.nextDescription);
+      if (requests.length === 1 && phase.tool) return { id: "catalog-barrier", name: "list_files", args: {} };
+      if (requests.length === 1 && phase.retry) return { failure: "AUTH" };
+      return "Completed";
+    }));
+    const agent = await ctx.agentLoop.create(SessionId("skill-steps"), route);
+    for (phase of probe.phases) {
+      requests = [];
+      agent.followup(user(phase.input)); await agent.whenIdle();
+      trace.push({ phase: phase.id, requests });
+    }
+    assert.deepEqual(trace.map(({ requests }) => requests.map(({ reads }) => reads)), [[1], [1], [1], [1], [1, 1], [2, 2], [2]]);
+    assert.equal(trace[3].requests[0].entries[0][1], probe.phases[3].admittedDescription);
+    assert.equal(trace[4].requests[1].entries[0][1], probe.phases[4].nextDescription);
+    assert.deepEqual(trace[5].requests[1], trace[5].requests[0]);
+    assert.equal(trace[6].requests[0].entries[0][1], probe.phases[5].nextDescription);
+    return trace;
+  });
+}
+
+async function referenceSkillLifecycle(root) {
+  const probe = skillLifecycle, id = SessionId("skill-lifecycle"), journal = join(root, "skill-lifecycle");
+  const trace = {};
+  let reads = 0, restarted = false;
+  const setup = async (ctx) => {
+    await ctx.plugin(Loader);
+    ctx.loader.builtins.group = Group;
+    await ctx.plugin(SkillRegistry);
+    await ctx.plugin(ToolSkill);
+    await ctx.plugin(TokenMeter);
+    await ctx.plugin(BasicCompactionEngine, { auto: false });
+    await ctx.plugin(AgentPresets, { default: "first" });
+    for (const preset of ["first", "second"]) {
+      const first = preset === "first";
+      ctx.loader.builtins[preset + "Skills"] = { inject: ["skills"], apply(host) {
+        host.skills.registerProvider(() => ({ name: preset, async list() {
+          return [probe.shared, first ? probe.firstOnly : probe.secondOnly].map((name) => ({ name,
+            description: name === probe.shared ? (first ? "First" : "Second") : restarted ? "Updated after restart" : "Preset entry",
+            source: preset, provider: preset, rank: 1, locator: name, invocation: { modelInvocable: true, userInvocable: true } }));
+        }, async get(candidate) {
+          reads++;
+          return { ...candidate, content: first ? probe.before : restarted ? probe.refreshed : probe.after };
+        } }));
+      } };
+      await ctx.agentPresets.register({ id: preset, plugins: [{ name: "cordis:" + preset + "Skills" }] });
+    }
+  };
+  const observe = (ctx, record) => ctx.llm.registerAdapter([route.provider], new Adapter(({ messages, purpose }) => {
+    if (purpose === "compaction") return probe.summary;
+    record(observeSkillLifecycle(messages.map(({ source }) => source), messages.filter(({ source }) => source?.kind === "skill-invocation").map(text), reads));
+    return "Completed";
+  }));
+  const ask = async (agent, prompt) => { agent.followup(user(prompt)); await agent.whenIdle(); };
+  await withLoop(journal, setup, async (ctx) => {
+    let phase = "selected";
+    observe(ctx, (result) => { if (phase) trace[phase] = result; });
+    const { agent } = await ctx.agents.create({ sessionId: id, agentOptions: route,
+      setup: async (child) => { await ctx.agentPresets.mount(child, "first"); } });
+    trace.warm = (await ctx.skills.list({ scope: scopeOf(agent.ctx) })).map(({ name }) => name).sort();
+    await ctx.agentPresets.select(agent, "second");
+    await ask(agent, probe.initial);
+    phase = "invoked"; await ask(agent, probe.invocation);
+    await assert.rejects(ctx.agentPresets.select(agent, "first"), /already started/);
+    phase = ""; await ask(agent, probe.older); await ask(agent, probe.recent);
+    assert.ok(await ctx.compaction.compactNow(agent, AbortSignal.timeout(5000)));
+    phase = "compacted"; await ask(agent, probe.initial);
+    assert.ok(await ctx.sessions.flush(agent.session));
+  });
+  restarted = true;
+  await withLoop(journal, setup, async (ctx) => {
+    let phase = "restarted";
+    observe(ctx, (result) => { trace[phase] = result; });
+    const { agent } = await ctx.agents.resume({ resumeSessionId: id, agentOptions: route,
+      setup: async (child, { session }) => { await ctx.agentPresets.mount(child, ctx.agentPresets.presetForSession(session)); } });
+    await ask(agent, probe.initial);
+    phase = "reinvoked"; await ask(agent, probe.invocation);
+    phase = "unchanged"; await ask(agent, probe.initial);
+  });
+  assert.deepEqual(Object.values(trace).slice(1).map((row) => row.reads), [0, 1, 1, 1, 2, 2]);
+  assert.deepEqual(trace.invoked.blocks, [probe.after]);
+  assert.deepEqual(trace.compacted.blocks, []);
+  assert.equal(trace.compacted.update, true);
+  assert.deepEqual(trace.reinvoked.blocks, [probe.refreshed]);
+  assert.equal(trace.restarted.entries.find(([name]) => name === probe.secondOnly)?.[1], "Updated after restart");
+  return trace;
+}
+
 async function referenceAlignment(root, ctx) {
   const result = {};
+  result[skillLifecycle.name] = await referenceSkillLifecycle(root);
+  result[skillStepProbe.name] = await referenceSkillSteps(root);
   const sessionId = SessionId("cold-continuation"), persisted = join(root, "journal");
   let writes = 0;
   const register = async (context) => context.tools.register(defineContentToolFixture({
@@ -177,6 +371,9 @@ async function referenceAlignment(root, ctx) {
     context.llm.registerAdapter([route.provider], new Adapter(({ messages }) => {
       if (attempt++ === 0) {
         skill.direct = normalizeSkillBlock(messages.map(text).find((value) => value.startsWith("<skill_content")) ?? "");
+        return "direct skill read";
+      }
+      if (attempt === 2) {
         return { id: "skill-load", name: "skill", args: { name: "shared-skill" } };
       }
       const output = messages.find((message) => message.role === "tool" && message.toolCallId === "skill-load");
@@ -186,8 +383,11 @@ async function referenceAlignment(root, ctx) {
     const agent = await context.agentLoop.create(SessionId("skills-alignment"), route);
     agent.followup(user(skillGesture));
     await agent.whenIdle();
+    agent.followup(user(skillLookupPrompt));
+    await agent.whenIdle();
     result["Skills return the same model block from user and tool and read a long source"] = skill;
   });
+  result[skillCatalogProbe.name] = await referenceSkillCatalog(root);
 
   const mcpConfig = (serverName, script) => ({ serverName, transport: "stdio", command: process.execPath, env: {},
     args: ["-e", script], startupTimeoutMs: 3000, closeTimeoutMs: 1500, failOnStartupError: true });
@@ -241,6 +441,24 @@ async function referenceAlignment(root, ctx) {
     await context.plugin(ScheduleTools);
   }, async (context) => {
     const target = await context.agentLoop.create(SessionId("schedule-target"), route);
+    const timedTarget = await context.agentLoop.create(SessionId("schedule-timed-target"), route);
+    const { name, later, earlier } = scheduleWakeProbe;
+    const seen = [];
+    context.on("schedule/resolve-agent", async () => timedTarget);
+    const timedAdapter = context.llm.registerAdapter([route.provider], new Adapter(async ({ messages }) => {
+      const reminder = text(messages.findLast(({ source }) => source?.kind === "schedule"));
+      for (const { prompt } of [earlier, later]) if (reminder.includes(prompt)) seen.push(prompt);
+      return "processed";
+    }));
+    const schedule = ({ prompt, ms }) => context.schedule.create({ title: prompt, prompt,
+      timing: { kind: "at", at: new Date(Date.now() + ms).toISOString() }, target: { kind: "session", sessionId: timedTarget.id } }, timedTarget.id);
+    await schedule(later);
+    await schedule(earlier);
+    const quietBeforeDue = seen.length === 0;
+    await until(() => seen.length, (count) => count > 0);
+    await timedTarget.whenIdle();
+    timedAdapter.replace([]);
+    result[name] = { quietBeforeDue, seen, earlierOnly: seen[0] === earlier.prompt && seen.length === 1 };
     const create = (id, selection) => executeToolFixture(context, { agent: target, name: "schedule_create",
       arguments: { title: scheduleTitle, prompt: schedulePrompt, rrule: scheduleTimingFixture.rrule, ...(selection ? { target: selection } : {}) },
       callId: ToolCallId(id), signal: AbortSignal.timeout(3000) });

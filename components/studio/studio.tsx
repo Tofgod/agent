@@ -108,23 +108,41 @@ export default function Studio() {
   const [sidebar, setSidebar] = useState(true), [showSettings, setShowSettings] = useState(false);
   const [extensions, setExtensions] = useState<"skills" | "mcp" | "presets" | "schedules" | null>(null);
   const [inspecting, setInspecting] = useState(false);
-  const [skillCommands, setSkillCommands] = useState<SkillEntry[]>([]);
+  const [skillCatalog, setSkillCatalog] = useState<{ scope: string; entries: SkillEntry[] }>();
+  const [presetRevision, setPresetRevision] = useState(0);
   const [showSkills, setShowSkills] = useState(false);
   const [skillDocument, setSkillDocument] = useState<{ projectId: string; skill: SkillEntry } | null>(null);
   const [slashIndex, setSlashIndex] = useState(0), [slashDismissed, setSlashDismissed] = useState("");
   const [composerCaret, setComposerCaret] = useState<number>();
   const pendingSkill = skillCompletion(draft.text, composerCaret ?? draft.text.length);
   const slash = pendingSkill?.query;
-  const skillNames = useMemo(() => new Set(skillCommands.map(({ name }) => name)), [skillCommands]);
+  const watchSkills = slash !== undefined || showSkills;
+  const skillCommands = skillCatalog?.scope === scope ? skillCatalog.entries : undefined;
+  const skillNames = useMemo(() => new Set(skillCommands?.map(({ name }) => name)), [skillCommands]);
   useEffect(() => {
-    if (!projectId) return;
-    const controller = new AbortController();
-    setSlashIndex(0);
-    void api<SkillEntry[]>(scopedEndpoint(scope, "/skills/commands"), { signal: controller.signal })
-      .then((items) => { if (!controller.signal.aborted) setSkillCommands(items); }).catch(() => {});
-    return () => controller.abort();
-  }, [scope, slash === undefined]);
-  const slashSuggestions = slash === undefined || slashDismissed === draft.text ? [] : skillCommands.filter(({ name }) =>
+    if (!scope) return;
+    let pending: AbortController;
+    const refresh = () => {
+      pending?.abort();
+      const controller = pending = new AbortController();
+      void api<SkillEntry[]>(scopedEndpoint(scope, "/skills/commands"), { signal: controller.signal })
+        .then((entries) => {
+          if (!controller.signal.aborted) {
+            setSkillCatalog({ scope, entries });
+            setSlashIndex(0);
+          }
+        }).catch(() => {});
+    };
+    refresh();
+    const stream = watchSkills ? new EventSource("/api/studio" + scopedEndpoint(scope, "/skills/watch")) : undefined;
+    if (stream) {
+      let connected = false;
+      stream.onmessage = refresh;
+      stream.onopen = () => { if (connected) refresh(); connected = true; };
+    }
+    return () => { stream?.close(); pending?.abort(); };
+  }, [scope, watchSkills, presetRevision]);
+  const slashSuggestions = slash === undefined || slashDismissed === draft.text ? [] : (skillCommands ?? []).filter(({ name }) =>
     [...slash].reduce((position, character) => position < 0 ? -1 : (name.indexOf(character, position) + 1 || -1), 0) >= 0)
     .sort((a, b) => Number(b.name.startsWith(slash)) - Number(a.name.startsWith(slash)) || a.name.localeCompare(b.name)).slice(0, 8);
   const [workspaceOpen, setWorkspaceOpen] = useState(true), [fileTreeOpen, setFileTreeOpen] = useState(true);
@@ -224,7 +242,7 @@ export default function Studio() {
       localStorage.setItem("mujian.session." + projectId, sessionId);
     }
     setHistorySearch(null); setMatches(null); setRename(null); setOutlineOpen(false); setManageSessions(false); jumpMessage.current = "";
-    setComposerCaret(undefined); setSkillCommands([]);
+    setComposerCaret(undefined);
     historySearchRequest.current?.abort();
     workspace.current = null;
     previewRequest.current++; setVersionedFile(null); setFileId(null); setReview(null); setSnapshot(null); setLoadingHistory(false); historyAnchor.current = null; setHistorySteps([]); setFolders({}); setNotice("");
@@ -322,12 +340,7 @@ export default function Studio() {
     }) });
     if (activeId.current === scope) { setInspecting(false); setSessionId(session.id); }
   };
-  const openSkillCommands = async () => {
-    try {
-      const items = await api<SkillEntry[]>(scopedEndpoint(scope, "/skills/commands"));
-      if (activeId.current === scope) { setSkillCommands(items); setShowSkills(true); }
-    } catch (e) { error(e); }
-  };
+  const openSkillCommands = () => setShowSkills(true);
   const previewSkill = async (name: string) => {
     try {
       const items = await api<SkillEntry[]>(scopedEndpoint(scope, "/skills/commands"));
@@ -1040,16 +1053,17 @@ export default function Studio() {
     <Suspense fallback={null}>
       {extensions && currentSnapshot && <StudioExtensions key={scope} projectId={projectId} session={sessionId}
         sessions={currentSnapshot.sessions ?? []} readOnly={archived} initial={extensions} onClose={() => setExtensions(null)}
+        onPresetChange={() => { setSkillCatalog(undefined); setPresetRevision((revision) => revision + 1); }}
         onOpenSession={(id, owner) => { setExtensions(null); setProjectId(owner); setSessionId(id); }}/>}
       {inspecting && currentSnapshot && <ExecutionInspector key={scope} projectId={projectId} sessionId={sessionId}
         active={currentSnapshot.runs.some(isActiveRun)} revision={currentSnapshot.cursor} readOnly={archived} onClose={() => setInspecting(false)} onFork={forkAtCheckpoint}/>}
     </Suspense>
     {showSkills && currentSnapshot && <Modal title="使用技能" compact onClose={() => setShowSkills(false)}>
       <div className="extension-panel">
-        {skillCommands.length ? <ul className="extension-list">{skillCommands.map((skill) =>
+        {skillCommands?.length ? <ul className="extension-list">{skillCommands.map((skill) =>
           <li key={skill.name}><button type="button" className="extension-row" onClick={() => pickSkill(skill)}>
             <span><strong>/{skill.name}</strong><small>{skill.description}</small></span></button></li>)}</ul>
-          : <button type="button" className="button" onClick={() => { setShowSkills(false); setExtensions("skills"); }}>管理 Skills</button>}
+          : skillCommands && <button type="button" className="button" onClick={() => { setShowSkills(false); setExtensions("skills"); }}>管理 Skills</button>}
       </div>
     </Modal>}
   </main>;

@@ -25,7 +25,7 @@ function fileTool(schema: AgentTool, label: string, mode?: "parallel"): ToolRegi
 }
 export const fileTools = [
   fileTool(tool("list_files", "查看项目文件和目录，可指定目录前缀；结果分页，使用 next_offset 继续。", { directory: str, offset: integer, limit: integer }), "查看目录", "parallel"),
-  fileTool(tool("read_file", "按路径或文件 ID 读取项目文件，可指定引用中的 version 查看历史版本。用 next_offset、next_column 继续未读内容。图片、视频返回素材信息。", { file_path: str, file_id: str, version: integer, offset: integer, column: integer, limit: integer }), "读取文件", "parallel"),
+  fileTool(tool("read_file", "按路径或文件 ID 读取项目文件，可指定引用中的 version 查看历史版本。用 next_offset、next_column 继续未读内容。图片、视频返回素材信息。技能包的附带文件请用 skill 的 resource 参数读取。", { file_path: str, file_id: str, version: integer, offset: integer, column: integer, limit: integer }), "读取文件", "parallel"),
   fileTool(tool("search_files", "在项目文本中搜索字面量，返回匹配行。", { query: str, directory: str }, ["query"]), "搜索文件", "parallel"),
   fileTool(tool("write_file", "创建或完整更新文本文件，自动创建父目录。创作文档使用 Markdown；格式自由。", {
     file_path: str, content: str, kind: { type: "string", enum: ["document", "script", "storyboard", "characters", "review"] }, version: integer,

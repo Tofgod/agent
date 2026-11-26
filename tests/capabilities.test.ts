@@ -69,7 +69,7 @@ test("live child route resolution checks credentials and model modalities withou
   });
   const signal = AbortSignal.timeout(3000), native = { ...settings, textBaseUrl: "https://api.deepseek.com/anthropic" };
   await assert.rejects(resolveLiveDeepSeekModel({ ...native, textApiKey: "fixture-auth-denied" }, signal), { code: "MODEL_NOT_CONFIGURED" });
-  await assert.rejects(resolveLiveDeepSeekModel({ ...native, textApiKey: "fixture-model-missing" }, signal), { code: "MODEL_ROUTE_UNAVAILABLE" });
+  assert.equal((await resolveLiveDeepSeekModel({ ...native, textApiKey: "fixture-model-missing" }, signal)).id, "deepseek-flash");
   const textOnly = { ...native, textApiKey: "fixture-text-only" };
   assert.deepEqual((await resolveLiveDeepSeekModel(textOnly, signal)).inputModalities, ["text"]);
   assert.deepEqual((await resolveLiveDeepSeekModel(textOnly, signal)).thinking, [false, true]);
