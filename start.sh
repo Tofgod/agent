@@ -23,16 +23,24 @@ case "$platform" in
   *) fail "请在 macOS、Linux 或 Windows 的 WSL 里运行此脚本。" ;;
 esac
 
-linux_arch=
+machine="$(uname -m)"
+if [ "$platform" = Darwin ] && [ "$machine" = x86_64 ] &&
+  [ "$(sysctl -in hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+  machine=arm64
+fi
+runtime_arch=
+case "$machine" in
+  x86_64) runtime_arch=x64 ;;
+  aarch64|arm64) runtime_arch=arm64 ;;
+esac
 node_dir=
-if [ "$platform" = Linux ]; then
-  case "$(uname -m)" in
-    x86_64) linux_arch=x64 ;;
-    aarch64|arm64) linux_arch=arm64 ;;
+media_dir=
+if [ -n "$runtime_arch" ]; then
+  case "$platform" in
+    Darwin) node_target="darwin-$runtime_arch"; media_dir="$PWD/.studio-runtime/ffmpeg-$node_target" ;;
+    Linux) node_target="linux-$runtime_arch" ;;
   esac
-  if [ -n "$linux_arch" ]; then
-    node_dir="$PWD/.studio-runtime/node-linux-$linux_arch"
-  fi
+  node_dir="$PWD/.studio-runtime/node-$node_target"
 fi
 
 node_ready() {
@@ -50,26 +58,30 @@ media_ready() (
   printf '%s\n' "$encoders" | awk '$2 == "libx264" { h264=1 } $2 == "aac" { aac=1 } END { exit !(h264 && aac) }'
 )
 
-brew_bin=
-find_brew() {
-  brew_bin="$(command -v brew || true)"
-  if [ -z "$brew_bin" ] && [ -x /opt/homebrew/bin/brew ]; then brew_bin=/opt/homebrew/bin/brew; fi
-  if [ -z "$brew_bin" ] && [ -x /usr/local/bin/brew ]; then brew_bin=/usr/local/bin/brew; fi
-  [ -n "$brew_bin" ]
-}
-
 load_tools() {
-  if [ "$platform" = Darwin ] && find_brew; then
-    brew_prefix="$("$brew_bin" --prefix)"
-    export PATH="$PATH:$brew_prefix/bin"
+  brew_prefix=
+  if [ "$platform" = Darwin ]; then
+    brew_prefix="${HOMEBREW_PREFIX:-}"
+    if [ -z "$brew_prefix" ]; then
+      case ":$PATH:" in
+        *:/opt/homebrew/bin:*) brew_prefix=/opt/homebrew ;;
+        *:/usr/local/bin:*) brew_prefix=/usr/local ;;
+      esac
+    fi
+  fi
+  if [ -n "$brew_prefix" ]; then
     if ! node_ready && [ -x "$brew_prefix/opt/node@24/bin/node" ]; then
       export PATH="$brew_prefix/opt/node@24/bin:$PATH"
     fi
     if ! media_ready && [ -x "$brew_prefix/opt/ffmpeg-full/bin/ffmpeg" ]; then
       export PATH="$brew_prefix/opt/ffmpeg-full/bin:$PATH"
     fi
-  elif [ -n "$node_dir" ] && [ -x "$node_dir/bin/node" ] && ! node_ready; then
+  fi
+  if [ -n "$node_dir" ] && [ -x "$node_dir/bin/node" ] && ! node_ready; then
     export PATH="$node_dir/bin:$PATH"
+  fi
+  if [ -n "$media_dir" ] && [ -x "$media_dir/bin/ffmpeg" ] && ! media_ready; then
+    export PATH="$media_dir/bin:$PATH"
   fi
 }
 
@@ -77,23 +89,23 @@ download() {
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --retry 2 "$@"
 }
 
-install_homebrew() (
-  installer="$(mktemp -t doman-homebrew)"
-  trap 'rm -f -- "$installer"' 0
-  printf '正在准备 Homebrew。安装器可能要求确认或输入系统密码。\n'
-  download -o "$installer" https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh
-  /bin/bash "$installer"
-)
+verify_archive() {
+  if [ "$platform" = Darwin ]; then
+    printf '%s  %s\n' "$1" "$2" | shasum -a 256 -c -
+  else
+    printf '%s  %s\n' "$1" "$2" | sha256sum -c -
+  fi
+}
 
-install_linux_node() (
+install_local_node() (
   mkdir -p .studio-runtime
   staging="$(mktemp -d "$PWD/.studio-runtime/node-install.XXXXXX")"
   trap 'rm -rf -- "$staging"' 0
-  printf '正在下载 Node.js 24 到项目本地目录。\n'
+  printf '正在为 %s 下载 Node.js 24 和 npm。\n' "$node_target"
   release=https://nodejs.org/dist/latest-v24.x
-  download -o "$staging/SHASUMS256.txt" "$release/SHASUMS256.txt"
-  release_entry="$(awk -v arch="$linux_arch" '$2 ~ ("^node-v24\\.[0-9]+\\.[0-9]+-linux-" arch "\\.tar\\.gz$") { print $1, $2; exit }' "$staging/SHASUMS256.txt")"
-  [ -n "$release_entry" ] || fail "Node.js 发布目录缺少适用的 Linux 安装包。"
+  download -o "$staging/SHASUMS256.txt" "$release/SHASUMS256.txt" || fail "无法读取 Node.js 发布清单，请检查与 nodejs.org 的连接。"
+  release_entry="$(awk -v target="$node_target" '$2 ~ ("^node-v24[.][0-9]+[.][0-9]+-" target "[.]tar[.]gz$") { print $1, $2; exit }' "$staging/SHASUMS256.txt")"
+  [ -n "$release_entry" ] || fail "Node.js 发布目录缺少 $node_target 安装包。"
   IFS=' ' read -r checksum archive <<EOF
 $release_entry
 EOF
@@ -101,21 +113,71 @@ EOF
     *[![:xdigit:]]*) fail "无法识别 Node.js 安装包的校验值。" ;;
   esac
   [ "${#checksum}" -eq 64 ] || fail "无法识别 Node.js 安装包的校验值。"
-  download -o "$staging/$archive" "$release/$archive"
-  (cd -- "$staging" && printf '%s  %s\n' "$checksum" "$archive" | sha256sum -c -) || fail "Node.js 下载校验失败。"
+  download -o "$staging/$archive" "$release/$archive" || fail "Node.js 下载失败，请检查网络后重试。"
+  (cd -- "$staging" && verify_archive "$checksum" "$archive") || fail "Node.js 下载校验失败。"
   mkdir "$staging/node"
   tar -xzf "$staging/$archive" -C "$staging/node" --strip-components=1
-  "$staging/node/bin/node" --version >/dev/null || fail "下载的 Node.js 无法在此系统运行。"
+  [ -x "$staging/node/bin/npm" ] && PATH="$staging/node/bin:$PATH" node_ready || fail "下载的 Node.js 或 npm 无法在此系统运行。"
   rm -rf -- "$node_dir"
   mv -- "$staging/node" "$node_dir"
 )
 
+require_macos() (
+  version="$(sw_vers -productVersion)"
+  if ! printf '%s\n' "$version" | awk -F. -v minimum="$1" '
+    BEGIN { split(minimum, required, ".") }
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      supported = ($1 + 0 > required[1] + 0 || ($1 + 0 == required[1] + 0 && $2 + 0 >= required[2] + 0))
+    }
+    END { exit !supported }
+  '; then
+    fail "$2 的预编译版本需要 macOS $1 或以上。当前系统是 macOS $version。"
+  fi
+)
+
+install_mac_media() (
+  # Use versioned ZIP archives and the publisher's SHA-256 values.
+  case "$runtime_arch" in
+    arm64)
+      build=arm64/1795207104_9.1
+      ffmpeg_sha=1f66e9a690a7f1c9e60b012379f8869c11818d1797f45b21dbb2f2564ba61ae1
+      ffprobe_sha=6ef2df5f575042923a28537ab37adf936f28bf3e7b85de23a1447ed447ec1dbd
+      ;;
+    x64)
+      build=amd64/1795212433_9.1
+      ffmpeg_sha=35b3d82cccc2c1d644d49d15f5e57eb913a08ef68f798042c90eecec62c51f1e
+      ffprobe_sha=41ca7b7cba7992e33f1da3f1bf54db8ec103a4d387b1bfac3162062e8b1074ad
+      ;;
+  esac
+  mkdir -p .studio-runtime
+  staging="$(mktemp -d "$PWD/.studio-runtime/media-install.XXXXXX")"
+  trap 'rm -rf -- "$staging"' 0
+  mkdir -p "$staging/ffmpeg/bin"
+  printf '正在为 %s 下载 FFmpeg 和 ffprobe。\n' "$node_target"
+  for tool in ffmpeg ffprobe; do
+    case "$tool" in ffmpeg) checksum="$ffmpeg_sha" ;; ffprobe) checksum="$ffprobe_sha" ;; esac
+    url="https://ffmpeg.martin-riedl.de/download/macos/$build/$tool.zip"
+    download -o "$staging/$tool.zip" "$url" || fail "$tool 下载失败，请检查网络后重试。"
+    (cd -- "$staging" && verify_archive "$checksum" "$tool.zip") || fail "$tool 下载校验失败。"
+    unzip -p "$staging/$tool.zip" "$tool" > "$staging/ffmpeg/bin/$tool"
+    chmod +x "$staging/ffmpeg/bin/$tool"
+  done
+  FFMPEG_PATH="$staging/ffmpeg/bin/ffmpeg" FFPROBE_PATH="$staging/ffmpeg/bin/ffprobe" media_ready ||
+    fail "下载的 FFmpeg 或 ffprobe 无法运行，或缺少字幕、H.264、AAC 能力。"
+  rm -rf -- "$media_dir"
+  mv -- "$staging/ffmpeg" "$media_dir"
+)
+
 install_mac_tools() {
-  if ! find_brew; then install_homebrew; fi
-  load_tools
-  find_brew || fail "没有找到 Homebrew。完成安装器提示后，请重新运行 sh setup.sh。"
-  if ! node_ready; then "$brew_bin" install node@24; fi
-  if ! media_ready; then "$brew_bin" install ffmpeg-full; fi
+  [ -n "$runtime_arch" ] || fail "当前 Mac 芯片架构 $machine 缺少可用的预编译包。"
+  if ! node_ready; then
+    require_macos 13.5 'Node.js 24'
+    install_local_node
+  fi
+  if ! media_ready; then
+    require_macos 12.0 'FFmpeg 9.1'
+    install_mac_media
+  fi
 }
 
 install_linux_tools() {
@@ -135,7 +197,7 @@ install_linux_tools() {
       sudo apt-get install -y "$@"
     fi
   fi
-  if ! node_ready; then install_linux_node; fi
+  if ! node_ready; then install_local_node; fi
 }
 
 load_tools
