@@ -5,6 +5,7 @@ import { CHAT_ATTACHMENT_LIMIT, STUDIO_NAME, type Artifact, type ChatSubmission,
 import { descendantRunIds, isActiveRun, projectChatFlow } from "@/lib/studio/conversation";
 import { applyWorkspaceDelta, prependHistory } from "@/lib/studio/workspace-feed";
 import { Popover, PopoverClose, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { WorkflowControls } from "./workflow-controls";
 import { JobOutputDetails } from "./job-output";
 import { AssistantTurn } from "./assistant-turn";
 import { FilePreview } from "./file-preview";
@@ -24,6 +25,7 @@ import { ConfirmSessionArchive, ManageSessions, TurnOutline, type SessionChange 
 const StudioExtensions = lazy(() => import("./extensions").then((module) => ({ default: module.StudioExtensions })));
 const SkillDocument = lazy(() => import("./extensions").then((module) => ({ default: module.SkillDocument })));
 const ExecutionInspector = lazy(() => import("./execution-inspector").then((module) => ({ default: module.ExecutionInspector })));
+const workflowCommands = [{ name: "goal", description: "查看、创建或管理持久目标" }, { name: "plan", description: "进入或退出计划模式" }];
 const agentName = { main: STUDIO_NAME, writer: "编剧", director: "导演" };
 type QueueDraft = { requestId: string; version: number; draft: ChatDraft };
 function HeaderPopover({ label, trigger, panel, iconOnly = false, children }: {
@@ -59,6 +61,7 @@ export default function Studio() {
   const [sessionId, setSessionId] = useState("");
   const [creatingSession, setCreatingSession] = useState(false);
   const scope = scopeKey(projectId, sessionId);
+  const [questionSeat, setQuestionSeat] = useState<{ scope: string; opened?: string; hidden: string[] }>();
   const [versionedFile, setVersionedFile] = useState<Artifact | null>(null);
   const previewRequest = useRef(0);
   const [loadingHistory, setLoadingHistory] = useState(false);
@@ -142,7 +145,10 @@ export default function Studio() {
     }
     return () => { stream?.close(); pending?.abort(); };
   }, [scope, watchSkills, presetRevision]);
-  const slashSuggestions = slash === undefined || slashDismissed === draft.text ? [] : (skillCommands ?? []).filter(({ name }) =>
+  const leadingCommand = pendingSkill?.start === 0;
+  const suggestions = leadingCommand ? [...workflowCommands, ...(skillCommands ?? [])
+    .filter(({ name }) => !workflowCommands.some((command) => command.name === name))] : skillCommands ?? [];
+  const slashSuggestions = slash === undefined || slashDismissed === draft.text ? [] : suggestions.filter(({ name }) =>
     [...slash].reduce((position, character) => position < 0 ? -1 : (name.indexOf(character, position) + 1 || -1), 0) >= 0)
     .sort((a, b) => Number(b.name.startsWith(slash)) - Number(a.name.startsWith(slash)) || a.name.localeCompare(b.name)).slice(0, 8);
   const [workspaceOpen, setWorkspaceOpen] = useState(true), [fileTreeOpen, setFileTreeOpen] = useState(true);
@@ -292,6 +298,17 @@ export default function Studio() {
   const currentSnapshot = snapshot && scopeKey(snapshot.project.id, snapshot.sessionId) === scope ? snapshot : undefined;
   const activeRun = currentSnapshot?.runs.find((run) => !run.parentRunId && isActiveRun(run));
   const backgroundTasks = currentSnapshot?.activeBackgroundTasks ?? [];
+  const scopeSeat = questionSeat?.scope === scope ? questionSeat : undefined;
+  const questions = currentSnapshot?.workflow?.interactions.filter(({ kind }) => kind === "question") ?? [];
+  const visibleQuestion = questions.find(({ id }) => id === scopeSeat?.opened) ??
+    questions.findLast(({ id, state }) => state === "waiting" && !scopeSeat?.hidden.includes(id)) ??
+    questions.findLast(({ id }) => !scopeSeat?.hidden.includes(id));
+  const showQuestion = (id: string, show = true) => setQuestionSeat((current) => {
+    const local = current?.scope === scope ? current : undefined;
+    const hidden = (local?.hidden ?? []).filter((key) => key !== id && questions.some((item) => item.id === key));
+    return { scope, opened: show ? id : undefined, hidden: show ? hidden : [...hidden, id] };
+  });
+  const holdQuestion = useCallback((id: string) => api(scopedEndpoint(scope, "/workflow/interactions/" + id + "/hold"), { method: "POST" }), [scope]);
   const queueItems = currentSnapshot?.chatQueue;
   const nextTurnItems = queueItems?.filter((item) => !item.targetRunId);
   const editClosed = Boolean(editing && snapshot && scopeKey(snapshot.project.id, snapshot.sessionId) === scope && !queueItems?.some((item) => item.requestId === editing.requestId));
@@ -349,7 +366,7 @@ export default function Studio() {
       if (activeId.current === scope) { setSkillDocument({ projectId, skill }); setWorkspaceOpen(true); if (window.innerWidth < 650) setFileTreeOpen(false); }
     } catch (e) { error(e); }
   };
-  const pickSkill = (skill: SkillEntry) => {
+  const pickSkill = (skill: Pick<SkillEntry, "name">) => {
     const insertion = "/" + skill.name;
     const match = showSkills ? undefined : pendingSkill;
     const prefix = match ? draft.text.slice(0, match.start) : "";
@@ -591,10 +608,11 @@ export default function Studio() {
         : entries);
     };
     try {
-      await api(scopedEndpoint(id, "/chat"), {
+      const result = await api<{ notice?: string }>(scopedEndpoint(id, "/chat"), {
         method: "POST", headers: { Prefer: "return=minimal" }, body: JSON.stringify(submission),
         signal: AbortSignal.any([pending.controller.signal, AbortSignal.timeout(20000)]),
       });
+      if (result.notice && activeId.current === id) setNotice(result.notice);
       settleEcho("accepted");
       return true;
     } catch (e) {
@@ -827,6 +845,7 @@ export default function Studio() {
           <div className={message.role === "user" ? "user-message-bubble" : undefined}>
           {message.role === "assistant" ? <AssistantTurn run={run} content={last ? message.content : ""}
             runs={snapshot.runs} steps={allSteps} replies={snapshot.replies || []} nodes={nodes} showStatus={last} showHistory={first}
+            questions={archived ? undefined : questions} onAnswerQuestion={showQuestion}
             onHistory={(steps) => setHistorySteps((old) => [...old, ...steps])} count={snapshot.stepCounts?.[message.runId || ""] || 0} files={snapshot.artifacts} onOpen={openFile}
             controlBackground={run?.payload.inherited ? undefined : (task, action) => void control(task, action)}
             control={(action) => { if (run) void control(run, action); }}/>
@@ -896,11 +915,18 @@ export default function Studio() {
       {chatScroll.readingHistory && <button className="chat-latest" onClick={chatScroll.jumpToLatest} title="回到最新消息" aria-label="回到最新消息"><ArrowDown size={16}/></button>}
       </div>
       {!archived && <div className="composer-wrap">
+        {currentSnapshot?.workflow && <WorkflowControls key={scope} scope={scope} value={currentSnapshot.workflow} readOnly={archived}
+          onCommand={(text) => void sendShortcut(text)} onHold={holdQuestion}
+          visibleQuestion={visibleQuestion?.id} onShowQuestion={showQuestion}
+          stopRun={stopTarget ? { busy: stoppingRun === stopTarget.id, stop: () => void stop(stopTarget) } : undefined}
+          onDecision={async (id, decision) => {
+            await api(scopedEndpoint(scope, "/workflow/interactions/" + id), { method: "POST", body: JSON.stringify(decision) });
+          }}/>}
         {!!nextTurnItems?.length && <ChatQueue key={scope} items={nextTurnItems} editingId={editing?.requestId} busy={Boolean(queueBusy) || sending || uploading}
           runId={activeRun?.stage === "agent" ? activeRun.id : undefined}
           onEdit={editQueueItem} onChange={(id, change) => void mutateQueue(id, change)}/>}
         {editClosed && <div className="queued-target" role="status">这条消息已离开待发队列，编辑内容仍在输入框中。</div>}
-        <div className="composer" onDragOver={(event) => {
+        <div className="composer" hidden={Boolean(visibleQuestion)} onDragOver={(event) => {
           if (event.dataTransfer.types.includes(projectFileDragType) || event.dataTransfer.types.includes("Files")) {
             event.preventDefault();
             event.dataTransfer.dropEffect = currentSnapshot && !uploadProject && !sending ? "copy" : "none";
@@ -916,7 +942,7 @@ export default function Studio() {
               }))}><FileIcon kind={attachment?.kind || "document"} size={13}/><span>{name}</span><X size={12}/></button>;
           })}
         </div>}
-        {!!slashSuggestions.length && <div className="skill-suggestions" role="listbox" aria-label="技能建议">
+        {!!slashSuggestions.length && <div className="skill-suggestions" role="listbox" aria-label="命令与技能建议">
           {slashSuggestions.map((skill, index) => <button key={skill.name} type="button" role="option" aria-selected={index === slashIndex}
             onMouseDown={(event) => event.preventDefault()} onMouseEnter={() => setSlashIndex(index)} onClick={() => pickSkill(skill)}>
             <strong>/{skill.name}</strong><small>{skill.description}</small></button>)}
@@ -957,6 +983,11 @@ export default function Studio() {
           <input className="visually-hidden" type="file" multiple ref={uploadInput} accept=".md,image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,audio/mpeg,audio/wav,audio/mp4,audio/webm,audio/ogg" onChange={(e) => { void upload(e.target.files); e.target.value = ""; }}/>
           <button className="icon-button" type="button" title="使用技能" aria-label="使用技能" disabled={!currentSnapshot || sending}
             onClick={() => void openSkillCommands()}><Command size={17}/></button>
+          {currentSnapshot?.workflow && <button className="queue-mode" type="button"
+            disabled={archived || sending} aria-pressed={currentSnapshot.workflow.plan.active}
+            onClick={() => void sendShortcut(currentSnapshot.workflow!.plan.active || currentSnapshot.workflow!.plan.pending ? "/plan off" : "/plan")}>
+            {currentSnapshot.workflow.plan.pending ? "计划模式（待生效）" : "计划模式"}
+          </button>}
           <div className="toolbar-spacer"/>
           {editing ? <button className="queue-mode" type="button" disabled={uploading || Boolean(queueBusy)} onClick={() => setQueueDrafts((drafts) => ({ ...drafts, [scope]: null }))}>取消编辑</button> :
             steerable && canSend && !draft.requestId && <button className="queue-mode" type="button" title="⌘ / Ctrl + Enter" onClick={() => void send(!defaultQueue)}>{defaultQueue ? "补充当前轮" : "排到下一轮"}</button>}

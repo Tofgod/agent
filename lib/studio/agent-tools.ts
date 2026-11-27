@@ -9,6 +9,7 @@ import { AppError } from "./security";
 import { projectRelativePath } from "./project-layout";
 import { ToolRegistry, type ToolContext, type ToolRegistration } from "./tool-registry";
 import { webTools } from "./web-tools";
+import { workflowTools } from "./workflow-tools";
 import { teamTools } from "./team-tools";
 import { scheduleTools, skillTools } from "./extension-tools";
 import { childExecution, childFields, childParameters, preflightChildModel, structuredOutputTool } from "./child-execution";
@@ -220,7 +221,7 @@ const collaborationTools: ToolRegistration[] = [
     },
   },
 ];
-const studioTools = [...fileTools, ...webTools, ...collaborationTools, ...teamTools, ...mediaTools];
+const studioTools = [...fileTools, ...webTools, ...collaborationTools, ...teamTools, ...mediaTools, ...workflowTools];
 const registrationName = (entry: ToolRegistration) => entry.name ?? (typeof entry.schema === "function" ? undefined : entry.schema.function.name);
 export const presetToolCatalog = [...studioTools, ...scheduleTools].flatMap((entry) => {
   const name = registrationName(entry);

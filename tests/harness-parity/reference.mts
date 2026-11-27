@@ -141,4 +141,6 @@ for (const scenario of cases) result.scenarios[scenario.name] = await run(scenar
 Object.assign(result.scenarios, await referenceRecoveryScenarios());
 const { referenceExtensions } = await import("./extensions-reference.mts");
 Object.assign(result.scenarios, await referenceExtensions());
+const { referenceWorkflowScenarios } = await import("./workflows-reference.mts");
+Object.assign(result.scenarios, await referenceWorkflowScenarios());
 process.stdout.write(JSON.stringify(result));

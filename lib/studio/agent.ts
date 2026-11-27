@@ -36,6 +36,8 @@ import { boundImages, imageDataUrl, offloadRequestImages } from "./images";
 import { observeRepeat, projectToolOutput, type ToolOutputRecord } from "./tool-output";
 import { parseSessionReferences, sessionReferenceWarning, stringifyReference } from "./session-reference";
 import { isMessagesRoute } from "./deepseek-messages";
+import { planPolicy, settleInteraction } from "./workflow-tools";
+import { agentIdentity } from "./agent-identity";
 import { messagesCapabilities, projectMessagesSeries, type MessagesSeries } from "./deepseek-history";
 
 function userInput(message: Omit<AgentInput, "id">, currentFiles: Map<string, Artifact>): AgentMessage {
@@ -205,10 +207,10 @@ export async function advanceAgent(options: {
     run = await store.updateRun(run, { status: "queued", label, payload: { ...run.payload, agent: state }, leaseUntil: run.leaseUntil }, false,
       kind, reference, toolRecords, skipped, projections, rejectedInputs);
   };
-  const park = async (waitingFor: string[], reference?: string, limits: { waitingForInputUntil?: number; waitingForTasksUntil?: number; waitingForJob?: true } = {}) => {
-    const { waitingForInputUntil, waitingForTasksUntil, waitingForJob } = limits;
-    state = { ...state, finalReply: undefined, waitingFor, waitingForJob, waitingForInputUntil, waitingForTasksUntil, waitingInputVersion: run.inputVersion };
-    await store.updateRun(run, { status: "waiting", label: waitingForInputUntil ? "等待协作消息" : "等待子任务", leaseUntil: run.leaseUntil,
+  const park = async (waitingFor: string[], reference?: string, limits: { waitingForInputUntil?: number; waitingForTasksUntil?: number; waitingForJob?: true; waitingForInteraction?: string } = {}) => {
+    const { waitingForInputUntil, waitingForTasksUntil, waitingForJob, waitingForInteraction } = limits;
+    state = { ...state, finalReply: undefined, waitingFor, waitingForJob, waitingForInteraction, waitingForInputUntil, waitingForTasksUntil, waitingInputVersion: run.inputVersion };
+    await store.updateRun(run, { status: "waiting", label: waitingForInteraction ? "等待用户决定" : waitingForInputUntil ? "等待协作消息" : "等待子任务", leaseUntil: run.leaseUntil,
       payload: { ...run.payload, agent: state } }, false, "tasks/waiting", reference, toolRecords);
   };
   const resumeAfterSummaryFailure = (): AgentState => {
@@ -306,7 +308,7 @@ export async function advanceAgent(options: {
   if (!manualCompact) state = { ...state, finalReply: undefined, finalReplyReason: undefined };
   let settledRequestId: string | undefined;
   const invokeModel = async (system: string, messages: AgentMessage[], tools: AgentTool[], visible = true, sourceCount = messages.length,
-    retry?: ModelStepRequest, toolBindings?: Record<string, string>) => {
+    retry?: ModelStepRequest, toolBindings?: Record<string, string>, planMode?: boolean) => {
     await ensureCurrent();
     const requestId = uid(), inputVersion = run.inputVersion;
     const route = retry ?? (!visible ? state.contextRoute : undefined) ?? target;
@@ -346,7 +348,7 @@ export async function advanceAgent(options: {
       ...(visible ? { toolRequestId: requestId, admittedTools: tools.map((item) => item.function.name), messagesSeries,
         contextRoute: { baseUrl: route.baseUrl, model: route.model }, unadmittedInputStart: undefined, unadmittedInputIds: undefined } : {}) };
     run = await store.beginModelCall({ ...run, payload: { ...run.payload, agent: state } }, requestId,
-      { ...request, thinking: { type: textThinking ? "enabled" : "disabled" } }, imageRepair);
+      { ...request, thinking: { type: textThinking ? "enabled" : "disabled" } }, imageRepair, planMode);
     const execution = watchExecution(store, { ...run, inputVersion });
     let lastWrite = 0, latestText = "", published = "", lastOutputAt: string | undefined;
     let usage: ModelUsage | undefined, providerRequestId: string | undefined, response: AgentMessage | undefined, firstOutput = false;
@@ -540,12 +542,43 @@ export async function advanceAgent(options: {
           state = { ...state, pendingNotices: [...state.pendingNotices ?? [], ...savedResult.additionalContexts] };
       } else if (receipt && call.function.name === "send_message") state = projectResult(state, call, false);
     }
-    state = { ...state, waitingFor: undefined, waitingForJob: undefined, waitingForInputUntil: undefined, waitingForTasksUntil: undefined, waitingInputVersion: undefined };
+    state = { ...state, waitingFor: undefined, waitingForJob: undefined, waitingForInteraction: undefined, waitingForInputUntil: undefined, waitingForTasksUntil: undefined, waitingInputVersion: undefined };
     if (state.structuredResult) {
       await save({ ...state, finalReply: assistant?.content?.trim() ?? "" }, "正在创作", "tools/settled");
       return;
     }
     needsCheckpoint = true;
+  }
+  if (state.waitingForInteraction) {
+    if (!run.parentRunId && await store.claimStepQueue(run)) {
+      await save(state, "处理本轮补充", "inbox/claimed");
+      return;
+    }
+    const call = calls[state.toolIndex];
+    const interaction = call && store.workflow.findInteraction(run.id, call.id);
+    const outcome = interaction
+      ? await settleInteraction({ store, run }, interaction, unseen.some((input) => !input.source && !input.scheduled))
+      : { result: { error: "用户交互已中断", code: "ASK_CANCELLED" } };
+    if ("waitForInteraction" in outcome) {
+      await park([], call.id, { waitingForInteraction: outcome.waitForInteraction });
+      return;
+    }
+    if (interaction?.kind === "approval") {
+      await save({ ...state, waitingForInteraction: undefined, waitingInputVersion: undefined }, "处理工具审批");
+      return;
+    }
+    if (!("result" in outcome)) throw new Error("用户交互返回了无效的等待状态");
+    state = { ...state, waitingForInteraction: undefined, waitingInputVersion: undefined };
+    state = projectResult(settleTool(state, call.id, outcome.result), call);
+    if ("concludesTurn" in outcome && outcome.concludesTurn) {
+      for (const remaining of calls.slice(state.toolIndex)) {
+        skipped.push({ call: remaining, index: state.toolIndex, requestId: state.toolRequestId });
+        state = settleTool(state, remaining.id, toolNotStarted);
+      }
+      state = { ...state, finalReply: assistant?.content?.trim() ?? "" };
+    }
+    await save(state, "处理用户决定", "tools/settled", call.id);
+    return;
   }
   if (state.waitingFor?.length || state.waitingForInputUntil) {
     if (!run.parentRunId && await store.claimStepQueue(run)) {
@@ -630,6 +663,10 @@ export async function advanceAgent(options: {
         await park(outcome.waitFor, item.id, { waitingForTasksUntil: outcome.waitForTasksUntil, waitingForJob: item.function.name === "job_output" ? true : undefined });
         return;
       }
+      if ("waitForInteraction" in outcome) {
+        await park([], item.id, { waitingForInteraction: outcome.waitForInteraction });
+        return;
+      }
       if ("waitForInputUntil" in outcome) {
         await park([], item.id, { waitingForInputUntil: outcome.waitForInputUntil });
         return;
@@ -702,6 +739,16 @@ export async function advanceAgent(options: {
     store.runtimeFiles(project.id), store.project(project.id, (await store.jobContext(run.id)).userId),
     external(),
   ]);
+  if (run.payload.goalRound && !store.workflow.isGoalRoundAdmitted(run) && store.workflow.hasCompetingInput(run)) {
+    state = { ...state, messages: state.messages.filter(({ source }) => source?.kind !== "goal-round" ||
+      source.goalId !== run.payload.goalRound!.goalId || source.round !== run.payload.goalRound!.round) };
+    state = { ...state, unadmittedInputStart: Math.min(state.unadmittedInputStart ?? state.messages.length, state.messages.length) };
+    if (!inputs.some((input) => !input.source && !input.scheduled)) {
+      await save({ ...state, finalReply: "" }, "让出目标续轮");
+      await store.finishAgent(run, "");
+      return;
+    }
+  }
   const scopedTasks = [...new Map([...collaborators, ...tasks].map((task) => [task.id, task])).values()];
   let registry = createToolRegistry({ ...toolContext, externalTools: mcp?.registrations });
   let availableTools = registry.schemas();
@@ -711,13 +758,17 @@ export async function advanceAgent(options: {
   if (depth >= maximum && delegationTools.length) sections.push({ name: "delegation-depth", text: delegationTools.map((name) =>
     "Delegation depth for `" + name + "`: current " + depth + ", maximum " + maximum + ", remaining levels 0. Do not call `" +
       name + "` at this depth; carry out the work directly.").join("\n") });
+  if (availableTools.some(({ function: { name } }) => registry.get(name)?.approval))
+    sections.push({ name: "approval-policy", text: store.workflow.approvalPolicy(run) === "never"
+      ? "本会话拒绝需要单次审批的工具调用。" : "工具在声明需要审批时会向用户请求单次批准。" });
   if (mcp?.resourceServers.length) sections.push({ name: "mcp", text: JSON.stringify({
     resource_servers: mcp.resourceServers, read_with: ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"],
     ...(mcp.instructions.length ? { external_mcp_instructions: mcp.instructions } : {}),
   }) });
   const reminder = projectRuntimeContext(state.messages, sections);
   state = { ...state, finalReply: undefined };
-  const system = renderAgentPrompt(run.payload.resultFollowup) + (preset?.instructions ? "\n\n本会话的用户预设\n" + preset.instructions : "") + (run.payload.childExecution?.outputSchema
+  const planMode = store.workflow.selectedPlan(run, agentIdentity(run));
+  const system = renderAgentPrompt(run.payload.resultFollowup) + (planMode ? "\n\n" + planPolicy : "") + (preset?.instructions ? "\n\n本会话的用户预设\n" + preset.instructions : "") + (run.payload.childExecution?.outputSchema
     ? "\n\n本次委派有结构化交付约定。完成后用 structured_output 提交符合工具参数定义的数据，提交后结束本轮。" : "");
   const pressureSurface = () => state.messages.slice(0, state.unadmittedInputStart);
   const measure = () => pricedTokens(estimateRequestTokens(system, availableTools, pressureSurface(), imagePricing.price), modelKey, state.contextMeasurement);
@@ -765,6 +816,8 @@ export async function advanceAgent(options: {
         const decision = await hook.preStep({ ...executionScope(run), messages: structuredClone(proposed), signal: execution.signal });
         execution.check();
         if (decision?.kind === "reject" || decision?.kind === "accept" && decision.messages?.length === 0 && !state.toolRequestId) {
+          if (run.payload.goalRound && !store.workflow.isGoalRoundAdmitted(run) && proposed.some(({ source }) => source?.kind === "goal-round"))
+            await store.workflow.rejectGoalRound(run);
           const closed = { ...state, messages: state.messages.slice(0, boundary), unadmittedInputStart: undefined, unadmittedInputIds: undefined };
           await save({ ...closed, finalReply: "" }, "整理结果", undefined, undefined, state.unadmittedInputIds);
           if (!await store.finishAgent(run, "")) await save({ ...closed, finalReply: undefined }, "继续处理新消息");
@@ -793,7 +846,7 @@ export async function advanceAgent(options: {
     if (invocations.length) state = { ...state, messages: [...state.messages, ...invocations] };
   }
   let response: AgentMessage | undefined;
-  try { response = await invokeModel(system, state.messages, availableTools, true, state.messages.length, undefined, registry.bindings()); }
+  try { response = await invokeModel(system, state.messages, availableTools, true, state.messages.length, undefined, registry.bindings(), planMode); }
   catch (error) {
     if (!(error instanceof AppError) || error.code !== CONTEXT_OVERFLOW || state.contextRecovery || !state.pendingRequest) throw error;
     await save(state, "整理上下文");

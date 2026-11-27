@@ -133,7 +133,7 @@ function SkillFiles({ endpoint, file, onSelect, children }: { endpoint: string; 
 function SkillsPanel({ endpoint, session, readOnly, initial }: { endpoint: string; session: string; readOnly: boolean; initial?: SkillEntry }) {
   const remote = useItems<SkillEntry>(endpoint + "/skills" + scopeQuery(session), "/api/studio" + endpoint + "/skills/watch" + scopeQuery(session), true);
   const [edit, setEdit] = useState<{ name?: string; scope: SkillEntry["scope"]; text: string } | null>(null);
-  const [scope, setScope] = useState<ManagedSkillScope>("project");
+  const [scope, setScope] = useState<ManagedSkillScope>("global");
   const [file, setFile] = useState("");
   const show = async (item: SkillEntry) => {
     const { text } = await api<{ text: string }>(endpoint + "/skills/" + item.scope + "/" + item.name + scopeQuery(session));

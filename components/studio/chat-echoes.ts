@@ -1,3 +1,4 @@
+import { workflowCommand } from "@/lib/studio/workflow-types";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { chatUserKey, type ChatFlowItem } from "@/lib/studio/conversation";
 import { CHAT_ATTACHMENT_LIMIT, type ChatSubmission, type MessageAttachment, type QueuedChat, type WorkspaceSnapshot } from "@/lib/studio/types";
@@ -8,7 +9,7 @@ export type ChatEcho = ChatSubmission & {
   error?: string;
 };
 
-export const showsInTranscript = (input: ChatSubmission) => input.mode !== "next-turn" && input.text !== "/compact";
+export const showsInTranscript = (input: ChatSubmission) => input.mode !== "next-turn" && input.text !== "/compact" && !workflowCommand(input.text);
 const storageKey = (scope: string) => "mujian.chat-echoes." + scope;
 const empty: readonly ChatEcho[] = [];
 

@@ -73,6 +73,7 @@ export function applyWorkspaceDelta(before: WorkspaceSnapshot | null, delta: Wor
     chatQueue: delta.chatQueue ?? before.chatQueue,
     sessions: delta.sessions ?? before.sessions,
     teamTasks: delta.teamTasks ?? before.teamTasks,
+    workflow: delta.workflow ?? before.workflow,
     activeBackgroundTasks: delta.activeBackgroundTasks ?? before.activeBackgroundTasks,
     deliveries: upsert(before.deliveries ?? [], delta.deliveries, (delivery) => delivery.id),
     artifacts: upsert(artifacts, delta.artifacts, (item) => item.id),

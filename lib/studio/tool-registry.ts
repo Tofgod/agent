@@ -30,7 +30,7 @@ export interface ToolContext {
 
 export interface ToolContinuation { concludesTurn?: boolean; additionalContexts?: AgentMessage[] }
 export type ToolOutcome = ({ result: Record<string, unknown>; images?: AgentImage[]; outputRef?: string; artifactIds?: string[]; observedTasks?: Run[] } & ToolContinuation)
-  | { waitFor: string[]; waitForTasksUntil?: number } | { waitForInputUntil: number };
+  | { waitFor: string[]; waitForTasksUntil?: number } | { waitForInputUntil: number } | { waitForInteraction: string };
 export interface ToolRegistration {
   name?: string;
   schema: AgentTool | ((context: ToolContext) => AgentTool | undefined);
@@ -38,6 +38,7 @@ export interface ToolRegistration {
   label: string;
   mode?: "parallel" | ((args: unknown, context: ToolContext) => boolean);
   timeoutMs?: number;
+  approval?: (args: unknown, context: ToolContext) => string | undefined;
   matchAdmitted?: boolean;
   binding?: string;
   execute: (context: ToolContext & { signal: AbortSignal }, callId: string, args: unknown) => Promise<ToolOutcome>;
@@ -103,7 +104,7 @@ export class ToolRegistry {
   isParallel(prepared: PreparedToolCall) {
     if (!prepared.valid) return false;
     const entry = this.get(prepared.call.function.name);
-    if (!entry || entry.available?.(this.context) === false) return false;
+    if (!entry || entry.approval || entry.available?.(this.context) === false) return false;
     const mode = entry.mode;
     try { return mode === "parallel" || (typeof mode === "function" && mode(prepared.args, this.context) === true); }
     catch { return false; }
@@ -138,6 +139,13 @@ export class ToolRegistry {
       if (entry.available?.(context) === false || this.currentRegistration?.(entry) === false) throw unavailable();
     };
     verifyRegistration();
+    const approvalReason = entry.approval?.(args, context);
+    if (entry.approval && (approvalReason || context.store.workflow.findInteraction(context.run.id, call.id)?.kind === "approval")) {
+      const decision = await context.store.workflow.requireApproval(context.run, call.id, name, approvalReason ?? name);
+      if ("waitForInteraction" in decision) return decision;
+      if (decision.outcome !== "allowed-once")
+        throw new AppError("用户未授权本次工具调用", 403, decision.outcome === "cancelled" ? "APPROVAL_CANCELLED" : "APPROVAL_REJECTED");
+    }
     await dispatch?.();
     signal.throwIfAborted();
     verifyRegistration();

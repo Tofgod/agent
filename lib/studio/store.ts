@@ -21,6 +21,7 @@ import type { ExecutionProjection } from "./execution-hooks";
 import { replaySession, sessionPatch, type SessionChange, type SessionEntry, type SessionPatch } from "./session-journal";
 import { builtinAgents } from "./agent-roles";
 import { committedRunEvent, copyForkHistory } from "./session-fork";
+import { SessionWorkflows } from "./workflow";
 import { notifyExecutions } from "./run-execution";
 import { sessionReferenceSnapshot, sessionReferenceTranscript, type PreparedSessionReference } from "./session-reference";
 import { hydratedModelRequest, recordModelRequest, restoreModelRequest } from "./model-request-record";
@@ -98,6 +99,11 @@ const unclaimedTaskResults = (wakeBackground: boolean) => `FROM agent_inbox i JO
         AND NOT EXISTS(SELECT 1 FROM runs received WHERE received.project_id=i.project_id AND received.session_id=i.session_id
           AND received.parent_run_id IS NULL AND json_extract(received.payload,'$.agent.backgroundNotices."'||child.id||'"')=${taskNoticeToken("child")}))` : ""})`;
 // Recheck the selected tasks at claim time, including when a job settles before its waiter parks.
+const interactionWaitBlocked = `(runs.status='waiting'
+  AND json_extract(runs.payload,'$.agent.waitingInputVersion') IS runs.input_version
+  AND EXISTS(SELECT 1 FROM studio_interactions i WHERE i.id=json_extract(runs.payload,'$.agent.waitingForInteraction')
+    AND i.state='waiting' AND (i.deadline IS NULL OR MAX(i.deadline,COALESCE(i.hold_until,0))>CAST(unixepoch('subsec')*1000 AS INTEGER)))
+  AND NOT EXISTS(SELECT 1 FROM chat_queue q WHERE q.target_run_id=runs.id AND q.status='pending'))`;
 const agentWaitBlocked = `(runs.status='waiting'
   AND json_extract(runs.payload,'$.agent.waitingInputVersion') IS runs.input_version
   AND NOT EXISTS(SELECT 1 FROM agent_inbox i WHERE i.project_id=runs.project_id AND i.run_id=runs.id AND i.target='next-step' AND i.state='pending')
@@ -205,6 +211,7 @@ export class Store {
   readonly schedulePolicy?: SchedulePolicy;
   readonly agents: readonly AgentDefinition[];
   readonly contextWindow: number;
+  readonly workflow: SessionWorkflows;
   readonly compaction: CompactionPolicies;
   readonly tools?: readonly ToolRegistration[];
   readonly resolveModel?: TextModelResolver;
@@ -218,8 +225,10 @@ export class Store {
   readonly maxJobWaitTimeout: number;
   constructor(public db: Database, options: { agents?: readonly AgentDefinition[]; contextWindow?: number; tools?: readonly ToolRegistration[]; compaction?: CompactionConfig;
     resolveModel?: TextModelResolver; modelRetry?: ModelRetryConfig;
+    goalMaxRounds?: number; goalBlockedAfterRounds?: number; questionTimeout?: number; parallelTodos?: boolean; defaultApprovalPolicy?: "ask" | "never";
     skills?: SkillLibrary; mcp?: McpManager; presetPlugins?: PresetPlugins; scheduleToolsEnabled?: boolean; schedulePolicy?: SchedulePolicy;
     completionDelivery?: "quiet" | "wakeup"; maxParallelTools?: number; maxDelegationDepth?: number; maxConsecutiveWakes?: number; maxConcurrentJobsPerOwner?: number; jobWaitTimeout?: number; maxJobWaitTimeout?: number } = {}) {
+    this.workflow = new SessionWorkflows(db, options.goalMaxRounds, options.goalBlockedAfterRounds, options.questionTimeout, options.parallelTodos, options.defaultApprovalPolicy);
     this.completionDelivery = options.completionDelivery ?? "wakeup";
     this.maxParallelTools = options.maxParallelTools ?? 10;
     this.maxDelegationDepth = options.maxDelegationDepth ?? 1;
@@ -587,7 +596,7 @@ export class Store {
       const cut = { position: Number(row.position), seq: latest.id, time: exact?.created_at ?? closed?.created_at ?? source.updatedAt,
         ...(source.parentRunId ? { childRoot: source.id } : {}),
         ...(exact ? { sourceRunId, settledCalls: seed.messages.flatMap((message) => message.tool_call_id ? [message.tool_call_id] : []) } : {}) };
-      return { seed, dispatched, preset, cwd, exact: Boolean(exact), history: copyForkHistory(this.db, projectId, sourceSessionId, session, cut,
+      return { seed, dispatched, preset, cwd, exact: Boolean(exact), workflows: this.workflow.forkStatements(source, session.id, cut.seq), history: copyForkHistory(this.db, projectId, sourceSessionId, session, cut,
         (roots) => this.historyFileChanges(projectId, roots, cut.time)) };
     });
     const seed = plan.exact ? { ...plan.seed, messages: (await repairToolHistory(plan.seed.messages, async (id) =>
@@ -599,6 +608,7 @@ export class Store {
         this.db.prepare("INSERT INTO session_preset_bindings(project_id,session_id,data) SELECT ?,?,? WHERE ?<>'null'")
           .bind(projectId, session.id, plan.preset, plan.preset)),
       ...plan.history,
+      ...plan.workflows,
       this.event(projectId, "feed:sessions", { id: session.id }),
     ]);
     return session;
@@ -884,6 +894,7 @@ export class Store {
   }
   async resumeInterruptedAgentRuns() {
     const rows = this.db.prepare(`SELECT * FROM runs WHERE status='failed' AND error_code='SESSION_INTERRUPTED'
+      AND json_type(payload,'$.goalRound') IS NULL
       AND NOT ${unfinishedAgentExecution} AND EXISTS(SELECT 1 FROM projects WHERE id=runs.project_id AND status<>'archived')
       AND (parent_run_id IS NOT NULL OR NOT EXISTS(SELECT 1 FROM runs active WHERE active.project_id=runs.project_id
         AND active.session_id=runs.session_id AND active.parent_run_id IS NULL AND active.status IN ('queued','running','waiting')))`).rows<Row>();
@@ -929,15 +940,16 @@ export class Store {
         substr(COALESCE(s.result,t.result),1,?) AS output,
         length(s.arguments)>? AS input_truncated,
         length(COALESCE(s.result,t.result))>? AS output_truncated,
-        s.name, CASE WHEN s.name IN ('web_search','web_fetch') AND s.status='done' THEN COALESCE(s.result,t.result) END AS web_result
+        s.name,s.call_id, CASE WHEN s.name IN ('web_search','web_fetch') AND s.status='done' THEN COALESCE(s.result,t.result) END AS web_result
       FROM execution_steps s LEFT JOIN tool_receipts t ON t.run_id=s.run_id AND t.call_id=s.call_id
       WHERE s.project_id=? AND s.run_id=? AND s.seq=?`)
       .bind(limit, limit, limit, limit, projectId, runId, seq)
-      .first<{ input: string; output: string | null; input_truncated: number; output_truncated: number | null; name: string; web_result: string | null }>();
+      .first<{ input: string; output: string | null; input_truncated: number; output_truncated: number | null; name: string; call_id: string; web_result: string | null }>();
     if (!row) throw new AppError("执行记录不存在", 404);
     const web = row.web_result ? webReceiptSources(row.name, row.web_result) : undefined;
+    const interaction = this.workflow.findInteraction(runId, row.call_id);
     return { input: row.input, output: row.output, inputTruncated: Boolean(row.input_truncated), outputTruncated: Boolean(row.output_truncated),
-      ...(web ? { web } : {}) };
+      ...(web ? { web } : {}), ...(interaction ? { interaction } : {}) };
   }
   executionPart(projectId: string, runId: string, seq: number, field: "input" | "output", offset: number, limit = 8000): ExecutionPart {
     const source = field === "input" ? "s.arguments" : "COALESCE(s.result,t.result)";
@@ -1463,7 +1475,7 @@ export class Store {
       WHERE excluded.user_seq>background_wake_budget.user_seq`)
       .bind(agentIdentity(run), run.projectId, run.sessionId ?? "", json(ids), run.id, run.leaseToken, run.inputVersion).run();
   }
-  async beginModelCall(run: Run, requestId: string, request: Record<string, unknown>, imageRepair?: { rejectedRequestId: string; removed: number }) {
+  async beginModelCall(run: Run, requestId: string, request: Record<string, unknown>, imageRepair?: { rejectedRequestId: string; removed: number }, planMode?: boolean) {
     const { modelRetry, modelDirectRetry: _directRetry, ...payload } = run.payload;
     const resuming = modelRetry && modelRetry.turn === request.turn && modelRetry.step === request.step &&
       modelRetry.inputVersion === run.inputVersion && (modelRetry.attempt ?? modelRetry.retry) + 1 === request.attempt;
@@ -1473,12 +1485,15 @@ export class Store {
       source?.kind === "task-result" && source.inlineOutput ? [source.inlineOutput] : []) : [];
     const scheduleNotices = request.purpose === "creation" && !run.parentRunId ? ((request.messages as AgentMessage[] | undefined) ?? [])
       .flatMap(({ source }) => source?.kind === "schedule-change" ? [source.id] : []) : [];
+    const goalAdmission = request.purpose === "creation" ? this.workflow.goalAdmission(run, requestId) : [];
+    const planAdmission = request.purpose === "creation" ? this.workflow.planAdmission(run, planMode) : undefined;
     const results = await this.db.batch([
       this.db.prepare(`INSERT INTO model_request_parts(id,content) SELECT key,value FROM json_each(?)
         WHERE EXISTS(SELECT 1 FROM runs WHERE id=? AND lease_token=? AND status IN ('queued','running') AND input_version=? AND agent_revision=?)
         ON CONFLICT(id) DO NOTHING`).bind(json(Object.fromEntries(record.parts)), run.id, run.leaseToken, run.inputVersion, journal.before),
       this.db.prepare("UPDATE runs SET status='running',label=?,stream_text='',payload=?,agent_revision=?,lease_until=?,updated_at=? WHERE id=? AND lease_token=? AND status IN ('queued','running') AND input_version=? AND agent_revision=?")
         .bind(request.purpose === "creation" ? "正在回复" : "整理上下文", json(journal.payload), journal.revision, Date.now() + 240000, t, run.id, run.leaseToken, run.inputVersion, journal.before),
+      ...(planAdmission ? [planAdmission.statement] : []),
       this.db.prepare("INSERT INTO model_calls(id,run_id,request,status,created_at,request_header_id) SELECT ?,?,?,'started',?,? WHERE changes()=1")
         .bind(requestId, run.id, json(record.metadata), t, record.headerId),
       ...(imageRepair ? [this.db.prepare("INSERT INTO events(project_id,type,data,created_at) SELECT ?,'image/offload',?,? WHERE changes()=1")
@@ -1486,6 +1501,7 @@ export class Store {
       ...(resuming ? [this.db.prepare("INSERT INTO events(project_id,type,data,created_at) SELECT ?,'llm/retry-started',?,? WHERE changes()=1")
         .bind(run.projectId, json({ runId: run.id, requestId, previousRequestId: modelRetry.requestId, retryId: modelRetry.retryId,
           turn: modelRetry.turn, step: modelRetry.step, retry: modelRetry.retry }), t)] : []),
+      ...goalAdmission,
       this.db.prepare("INSERT INTO events(project_id,type,data,created_at) SELECT ?,'request',?,? WHERE changes()=1")
         .bind(run.projectId, json({ runId: run.id, requestId, turn: run.generation, step: request.step, attempt: request.attempt }), t),
       ...journal.statements,
@@ -1510,6 +1526,7 @@ export class Store {
       const current = await this.run(run.id, run.projectId);
       throw new AppError("任务已停止或收到新输入", 409, current.inputVersion !== run.inputVersion ? "AGENT_STEER" : "RUN_STOPPED");
     }
+    planAdmission?.committed();
     return this.run(run.id, run.projectId);
   }
   async markModelFirstOutput(run: Run, id: string) {
@@ -1880,7 +1897,7 @@ export class Store {
       .bind(projectId, sessionId, Number(includeInherited)).rows().map(messageRow);
   }
   private readChatQueue(projectId: string, sessionId: string): QueuedChat[] {
-    return this.db.prepare("SELECT request_id,content,attachments,version,target_run_id,created_at FROM chat_queue WHERE project_id=? AND session_id=? AND status='pending' ORDER BY target_run_id IS NULL,turn_order,rowid")
+    return this.db.prepare("SELECT request_id,content,attachments,version,target_run_id,created_at FROM chat_queue WHERE project_id=? AND session_id=? AND status='pending' AND workflow_reply IS NULL ORDER BY target_run_id IS NULL,turn_order,rowid")
       .bind(projectId, sessionId).rows().map((row) => ({
         requestId: String(row.request_id), text: String(row.content), attachments: JSON.parse(String(row.attachments)) as MessageAttachment[], version: Number(row.version), createdAt: String(row.created_at),
         ...(row.target_run_id ? { targetRunId: String(row.target_run_id) } : {}),
@@ -1917,6 +1934,7 @@ export class Store {
       .bind(projectId, sessionId).rows<{ id: string }>();
     const run = active[0];
     if (!run) return this.acceptChat(projectId, input, undefined, sessionId);
+    if (this.workflow.planReviewClosedForChat(run.id)) return this.enqueueChat(projectId, input, sessionId);
     const time = now();
     const [inserted, directed] = await this.db.batch([
       this.queueAdmission(projectId, input, time, sessionId),
@@ -2117,7 +2135,7 @@ export class Store {
     const r = await this.db.prepare(`UPDATE runs SET status='running',lease_until=?,lease_token=?,lease_owner=?,updated_at=?,
       background=CASE WHEN stage='inspecting' AND agent_role='media' AND json_type(payload,'$.inspection')='object' THEN 1 ELSE background END
       WHERE id=? AND project_id=? AND status IN ('queued','running','waiting') AND lease_until<? AND next_attempt_at<=?
-      AND NOT ${dependencyPending} AND NOT ${agentWaitBlocked}`)
+      AND NOT ${dependencyPending} AND NOT ${agentWaitBlocked} AND NOT ${interactionWaitBlocked}`)
       .bind(Date.now() + 240000, uid(), process.pid, now(), id, projectId, Date.now(), Date.now()).run();
     return Boolean(r.meta.changes);
   }
@@ -2263,8 +2281,9 @@ export class Store {
     for (const row of blocked.results) await this.wakeForChildResult(row.parent_run_id, row.project_id);
     await this.promoteNestedTaskResults(size);
     await this.promoteTaskResults(size);
+    await this.workflow.driveGoals(size);
     const queues = await Promise.all([interactive, "NOT(" + interactive + ")"].map((lane) =>
-      this.db.prepare("SELECT id,project_id,stage,status FROM runs WHERE (status IN ('queued','running','waiting') OR (status='cancelled' AND json_extract(payload,'$.providerTaskId') IS NOT NULL AND (json_extract(payload,'$.cancellation.state') IN ('checking','running') OR (json_extract(payload,'$.cancellation.state')='unknown' AND COALESCE(json_extract(payload,'$.cancellation.attempts'),0)<3)))) AND lease_until<? AND next_attempt_at<=? AND NOT " + dependencyPending + " AND NOT " + agentWaitBlocked + " AND " + lane + " ORDER BY next_attempt_at,created_at LIMIT ?")
+      this.db.prepare("SELECT id,project_id,stage,status FROM runs WHERE (status IN ('queued','running','waiting') OR (status='cancelled' AND json_extract(payload,'$.providerTaskId') IS NOT NULL AND (json_extract(payload,'$.cancellation.state') IN ('checking','running') OR (json_extract(payload,'$.cancellation.state')='unknown' AND COALESCE(json_extract(payload,'$.cancellation.attempts'),0)<3)))) AND lease_until<? AND next_attempt_at<=? AND NOT " + dependencyPending + " AND NOT " + agentWaitBlocked + " AND NOT " + interactionWaitBlocked + " AND " + lane + " ORDER BY next_attempt_at,created_at LIMIT ?")
         .bind(time, time, size).all<{ id: string; project_id: string; stage: Stage; status: string }>()));
     return queues.flatMap((rows, lane) => rows.results.map((r) => ({ id: r.id, projectId: r.project_id, stage: r.stage, cancellation: r.status === "cancelled", interactive: lane === 0 })));
   }
@@ -2414,6 +2433,7 @@ export class Store {
     const project = this.readProject(projectId, userId);
     return { project, artifacts: this.readArtifacts(projectId), cursor, ...this.readHistoryPage(projectId, sessionId),
       chatQueue: this.readChatQueue(projectId, sessionId), sessionId, sessions: this.sessions(projectId),
+      workflow: this.workflow.view({ projectId, sessionId }),
       teamTasks: this.teamTasks(projectId, sessionId), activeBackgroundTasks: this.readActiveBackgroundTasks(projectId, sessionId) };
   }
   async snapshot(projectId: string, userId: string, sessionId = ""): Promise<WorkspaceSnapshot> {
@@ -2442,6 +2462,7 @@ export class Store {
     if (keys("chat-queue").length) delta.chatQueue = this.readChatQueue(projectId, sessionId);
     if (keys("sessions").length) delta.sessions = this.sessions(projectId);
     if (keys("delivery").length) delta.deliveries = this.deliveries(projectId, sessionId, keys("delivery"), false);
+    if (keys("workflow").includes(sessionId)) delta.workflow = this.workflow.view({ projectId, sessionId });
     if (keys("team").length) delta.teamTasks = this.teamTasks(projectId, sessionId);
 
     const artifacts = keys("artifact");

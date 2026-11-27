@@ -15,7 +15,8 @@ export interface AgentImage { id: string; version: number; path: string; objectK
 export interface ModelUsage { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens?: number; cacheWriteInputTokens?: number }
 export interface ContextMeasurement { inputTokens: number; estimatedTokens: number; modelKey: string }
 export interface ContextSection { name: string; text: string }
-export type AgentInputSource = { kind: "agent-message" | "delegation"; senderRunId: string; senderRole: AgentRole; senderName?: string } |
+export type AgentInputSource = import("./workflow-types").GoalRound & { kind: "goal-round" } |
+  { kind: "answer_to_pending_question"; tool: "ask_user_question"; callId: string } | { kind: "agent-message" | "delegation"; senderRunId: string; senderRole: AgentRole; senderName?: string } |
   { kind: "schedule-change"; id: string };
 export interface AgentInput { id: string; content: string; attachments?: MessageAttachment[]; source?: AgentInputSource; scheduled?: boolean; scheduledFrame?: string }
 export interface BackgroundOutputClaim { jobId: string; cursor: number; terminal: string }
@@ -45,6 +46,7 @@ export type AgentRole = string;
 export interface AgentDefinition { id: AgentRole; name: string; description?: string; textRoute?: { provider: "chat-completions" | "messages"; model: "deepseek-flash"; reasoning_effort?: ReasoningEffort | "off" } }
 export interface AgentState { messages: AgentMessage[]; seenUserIds: string[]; step: number; toolIndex: number; artifactIds: string[]; summary?: string;
   parentMessageCallId?: string;
+  waitingForInteraction?: string;
   childNotices?: Record<string, string>; waitingFor?: string[]; waitingForJob?: true; waitingForTasksUntil?: number; waitingForInputUntil?: number; waitingInputVersion?: number; pendingRequest?: { id: string }; observedVersions?: Record<string, number>; contextMeasurement?: ContextMeasurement;
   admittedTools?: string[]; toolRequestId?: string; finalReply?: string; finalReplyReason?: AgentMessage["finishReason"]; backgroundNotices?: Record<string, string>;
   messagesSeries?: MessagesSeries;
@@ -93,6 +95,7 @@ export interface RunPayload {
   workingDirectory?: string;
   instruction: string;
   resultFollowup?: true;
+  goalRound?: import("./workflow-types").GoalRound;
   imported?: true;
   archivedFork?: true;
   archivedOutputPath?: string;
@@ -157,6 +160,7 @@ export interface ExecutionStep {
   notDispatched?: true;
 }
 export interface ExecutionDetail {
+  interaction?: import("./workflow-types").Interaction;
   input: string; output: string | null; inputTruncated: boolean; outputTruncated: boolean;
   web?: { sources: { url: string; title: string; description?: string }[] };
   images?: { url: string; name: string }[];
@@ -175,6 +179,7 @@ export type FileComparison = TurnFileChange & (
   | { kind: "media"; before: { url: string; kind: ArtifactKind } | null; after: { url: string; kind: ArtifactKind } | null }
 );
 export interface WorkspaceSnapshot {
+  workflow?: import("./workflow-types").WorkflowView;
   project: Project; artifacts: Artifact[]; messages: Message[]; runs: Run[]; cursor: number; steps: ExecutionStep[]; stepCounts: Record<string, number>; replies: AssistantReply[];
   changesByRun?: Record<string, TurnFileChange[]>; chatQueue?: QueuedChat[];
   sessionId?: string; sessions?: ProjectSession[]; historyBefore?: number; deliveries?: Delivery[];
@@ -189,6 +194,7 @@ export interface TeamTask {
 }
 export interface BatchMember { key: string; role: string; instruction: string; dependencies: string[]; execution?: ChildExecution }
 export interface WorkspaceDelta {
+  workflow?: import("./workflow-types").WorkflowView;
   type: "delta"; projectId: string; after: number; cursor: number;
   project?: Project; artifacts?: Artifact[]; removedArtifacts?: string[]; messages?: Message[]; runs?: Run[];
   steps?: ExecutionStep[]; replies?: AssistantReply[]; removedReplies?: string[];

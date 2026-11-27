@@ -2,8 +2,9 @@ import { JobOutput } from "./job-output";
 import { memo, useEffect, useId, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { BookOpen, ChevronRight, FilePenLine, Film, FolderSearch, Globe, ListCollapse, LoaderCircle, Workflow, Wrench } from "lucide-react";
+import { BookOpen, ChevronRight, FilePenLine, Film, FolderSearch, Globe, ListCollapse, LoaderCircle, MessageCircleQuestionMark, Workflow, Wrench } from "lucide-react";
 import { STUDIO_NAME, type Artifact, type AssistantReply, type ExecutionDetail, type ExecutionPart, type ExecutionStep, type Run } from "@/lib/studio/types";
+import type { Interaction } from "@/lib/studio/workflow-types";
 import { conversationNodes, descendantRunIds, groupAssistantProcess, isActiveRun, isLiveWait, type ConversationNode } from "@/lib/studio/conversation";
 import { linkedArtifact } from "@/lib/studio/file-links";
 import { api } from "./settings";
@@ -11,7 +12,8 @@ type Action = "pause" | "resume" | "cancel" | "resubmit";
 const roles: Record<string, string> = { writer: "编剧", director: "导演", media: "制作", main: STUDIO_NAME };
 const roleName = (run?: Run) => run?.payload.agentDefinition?.name || (run ? roles[run.agentRole] || run.agentRole : roles.media);
 const names: Record<string, string> = { list_files: "查看目录", read_file: "读取文件", read_image: "查看图片", read_video: "创建视频检查任务", read_guide: "读取知识", web_search: "联网搜索", web_fetch: "阅读网页", list_agents: "查看协作任务", send_message: "发送协作消息", search_files: "搜索文件", write_file: "写入文件", edit_file: "修改文件", edit_files: "联动修改文件", move_file: "移动文件", rename_project: "命名项目", delegate: "委派任务", wait_for_tasks: "等待子任务", wait_for_input: "等待协作消息", control_task: "调整子任务", generate_image: "创建图片任务", generate_video: "创建视频任务", compose_video: "创建合成任务" };
-Object.assign(names, { skill: "读取技能", present_files: "标记交付文件", delegate_batch: "委派批次", list_team_tasks: "查看协作清单",
+Object.assign(names, { create_goal: "创建目标", get_goal: "读取目标", update_goal: "更新目标", todo_write: "更新个人待办",
+  ask_user_question: "询问用户", exit_plan_mode: "提交计划评审", skill: "读取技能", present_files: "标记交付文件", delegate_batch: "委派批次", list_team_tasks: "查看协作清单",
   save_team_task: "更新协作任务", list_tool_results: "查看工具记录", read_tool_result: "读取工具回执" });
 function readableError(message: string) {
   if (/An assistant message with.*tool_calls|insufficient tool messages/.test(message)) return "对话上下文缺少工具回执，请重试继续。";
@@ -37,7 +39,10 @@ function formatToolDetail(value: string, truncated: boolean) {
   }
   return value;
 }
-function ToolRow({ step, owner, delegateName, rootId, projectId, files, onOpen }: { step: ExecutionStep; owner?: Run; delegateName?: string; rootId: string; projectId?: string; files: Artifact[]; onOpen: (id: string) => void }) {
+function ToolRow({ step, owner, delegateName, rootId, projectId, files, onOpen, question, onAnswerQuestion }: {
+  step: ExecutionStep; owner?: Run; delegateName?: string; rootId: string; projectId?: string; files: Artifact[];
+  onOpen: (id: string) => void; question?: Interaction; onAnswerQuestion?: (id: string) => void;
+}) {
   const panelId = useId();
   const [expanded, setExpanded] = useState(false);
   const [detail, setDetail] = useState<ExecutionDetail>();
@@ -66,10 +71,12 @@ function ToolRow({ step, owner, delegateName, rootId, projectId, files, onOpen }
     } catch (reason) { setError((reason as Error).message); }
     finally { setLoadingPart(false); }
   };
-  const Icon = working ? LoaderCircle : /web_/.test(step.name) ? Globe : step.name === "skill" || /read_/.test(step.name) ? BookOpen : /write_|edit_|move_/.test(step.name) ? FilePenLine : /list_files|search_files/.test(step.name) ? FolderSearch : /video|image|production/.test(step.name) ? Film : /delegate|tasks|agents|message/.test(step.name) ? Workflow : Wrench;
+  const Icon = step.name === "ask_user_question" ? MessageCircleQuestionMark : working ? LoaderCircle : /web_/.test(step.name) ? Globe : step.name === "skill" || /read_/.test(step.name) ? BookOpen : /write_|edit_|move_/.test(step.name) ? FilePenLine : /list_files|search_files/.test(step.name) ? FolderSearch : /video|image|production/.test(step.name) ? Film : /delegate|tasks|agents|message/.test(step.name) ? Workflow : Wrench;
   const file = files.find((file) => file.path === step.summary);
   const target = step.name === "delegate" ? delegateName || roles[step.summary] || step.summary : step.summary.replace(/^\/(?:01_创作|02_参考|03_图片|04_视频|05_音频|06_字幕|07_成片|08_记录)\//, "");
   const action = names[step.name] || "执行工具", label = step.status === "done" ? ["wait_for_tasks", "wait_for_input"].includes(step.name) ? "已结束等待" : "已" + action : action;
+  const interaction = question ?? detail?.interaction;
+  const answer = interaction?.decision?.action === "answer" ? interaction.decision.answers : undefined;
   const receipt = detail && <>
     <div>调用参数{detail.inputTruncated && " · 部分内容"}</div>
     <pre>{formatToolDetail(detail.input, detail.inputTruncated)}</pre>
@@ -85,15 +92,28 @@ function ToolRow({ step, owner, delegateName, rootId, projectId, files, onOpen }
     <div className="execution-row" data-tool-id={step.callId} data-state={interrupted ? "interrupted" : step.status}>
       {projectId ? <button className="tool-disclosure" type="button" aria-expanded={expanded} aria-controls={expanded ? panelId : undefined}
         onClick={() => setExpanded(!expanded)}>
-        <Icon size={15} className={working ? "spinning" : undefined} aria-hidden="true"/><span>{label}</span>
+        <Icon size={15} className={Icon === LoaderCircle ? "spinning" : undefined} aria-hidden="true"/><span>{label}</span>
         <ChevronRight size={12} className="tool-chevron" aria-hidden="true"/>
       </button> : <><Icon size={15}/><span>{label}</span></>}
       {step.runId !== rootId && <span className="history-agent">{roleName(owner)}</span>}
       {target && (file ? <button className="history-target" title={file.path} onClick={() => onOpen(file.id)}>{file.path.split("/").pop()}</button> : <span className="history-target" title={step.summary}>{target}</span>)}
-      {(working || interrupted || unknown || ["failed", "interrupted", "unknown"].includes(step.status)) && <span className="history-state">{working ? "执行中" : step.notDispatched ? "未执行" : interrupted || step.status === "interrupted" ? "已中断" : step.status === "failed" ? "失败" : "结果待确认"}</span>}
+      {question ? <button className="history-target" type="button" onClick={() => onAnswerQuestion?.(question.id)}>回答问题</button>
+        : (working || interrupted || unknown || ["failed", "interrupted", "unknown"].includes(step.status)) && <span className="history-state">{working ? "执行中" : step.notDispatched ? "未执行" : interrupted || step.status === "interrupted" ? "已中断" : interaction?.state === "dismissed" ? "已关闭" : step.status === "failed" ? "失败" : "结果待确认"}</span>}
     </div>
     {expanded && <div id={panelId} className="tool-receipt">
-      {error ? <span role="status">{error}</span> : !detail ? <span role="status">读取中</span> : detail.web ? <>
+      {error ? <span role="status">{error}</span> : !detail ? <span role="status">读取中</span> : interaction ? <>
+        {interaction.plan && <MarkdownBody content={interaction.plan} files={files} onOpen={onOpen}/>}
+        {interaction.questions.map((item) => {
+          const result = answer?.find(({ id }) => id === item.id);
+          return <div className="interaction-receipt" key={item.id}>
+            <strong>{item.question}</strong>
+            {result && <span>{[...result.selected, result.custom].filter(Boolean).join(" · ") || "已跳过"}</span>}
+            {!result && item.options?.map(({ label, description }) => <span key={label}>{label}{description && " · " + description}</span>)}
+          </div>;
+        })}
+        {!answer && <span>{{ waiting: "等待用户", pending: "可稍后回答", answered: "已拒绝", dismissed: "已关闭", cancelled: "已中断" }[interaction.state]}</span>}
+        <details className="web-receipt-details"><summary>工具回执</summary><div>{receipt}</div></details>
+      </> : detail.web ? <>
           <ul className="web-sources" aria-label="网页来源">
             {detail.web.sources.map(({ url, title, description }, index) => <li key={url + index}>
               <a href={url} target="_blank" rel="noopener noreferrer" title={url}>{title}</a>
@@ -163,9 +183,10 @@ function AssistantProcess({ steps, running, children }: { steps: ExecutionStep[]
 }
 
 // Mirrors the reference's independent assistant-step and tool nodes instead of replacing one turn-wide text buffer.
-export function AssistantTurn({ run, content, control, controlBackground, runs, steps, replies, count, files, onOpen, nodes: selectedNodes, showStatus = true, showHistory = true, onHistory }: {
+export function AssistantTurn({ run, content, control, controlBackground, runs, steps, replies, count, files, onOpen, nodes: selectedNodes, showStatus = true, showHistory = true, onHistory, questions, onAnswerQuestion }: {
   run?: Run; content: string; control: (action: Action) => void; controlBackground?: (run: Run, action: Action) => void; runs: Run[]; steps: ExecutionStep[]; replies: AssistantReply[]; count: number; files: Artifact[]; onOpen: (id: string) => void;
   nodes?: ConversationNode[]; showStatus?: boolean; showHistory?: boolean; onHistory?: (steps: ExecutionStep[]) => void;
+  questions?: Interaction[]; onAnswerQuestion?: (id: string) => void;
 }) {
   const [extra, setExtra] = useState<ExecutionStep[]>([]), [loading, setLoading] = useState(false), [loadError, setLoadError] = useState(""), [clock, setClock] = useState(Date.now);
   const retrying = run?.status === "waiting" && Boolean(run.error) && run.nextAttemptAt > 0;
@@ -207,6 +228,7 @@ export function AssistantTurn({ run, content, control, controlBackground, runs, 
         running={node.steps.findLast((step) => step.status === "running" && isActiveRun(owners.get(step.runId)))}>
         {node.steps.map((step) => <ToolRow key={step.seq} step={step} owner={owners.get(step.runId)}
           delegateName={step.name === "delegate" ? children.find((item) => item.agentRole === step.summary)?.payload.agentDefinition?.name : undefined}
+          question={questions?.find(({ runId, callId }) => runId === step.runId && callId === step.callId)} onAnswerQuestion={onAnswerQuestion}
           rootId={run?.id || ""} projectId={run?.projectId} files={files} onOpen={onOpen}/>)}
       </AssistantProcess>;
       const reply = node.reply, owner = owners.get(reply.runId);

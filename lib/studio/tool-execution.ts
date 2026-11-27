@@ -29,7 +29,8 @@ export async function executeToolGroup(store: Store, run: Run, registry: ToolReg
     if (settled) return async (): Promise<ToolOutcome> => settled;
     const cached = await store.toolReceipt(run.id, call.id);
     await store.beginStep(run, call, step.requestId, step.index + index);
-    if (cached || store.toolStepDispatched(run.id, call.id))
+    const recoverableInteraction = ["ask_user_question", "exit_plan_mode"].includes(call.function.name);
+    if (cached || store.toolStepDispatched(run.id, call.id) && !recoverableInteraction)
       return async (): Promise<ToolOutcome> => cached && cached.result.status !== "pending"
         ? parallel ? cached : project(prepared, cached) : { result: toolOutcomeUnknown };
     return async (): Promise<ToolOutcome> => {

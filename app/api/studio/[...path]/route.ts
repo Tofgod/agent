@@ -1,3 +1,4 @@
+import { goalObjective, interactionDecision, workflowCommand } from "@/lib/studio/workflow-types";
 import { streamJobOutput } from "@/lib/studio/background-jobs";
 import { z } from "zod";
 import { serverContext, bodyJson, errorResponse } from "@/lib/studio/server";
@@ -147,6 +148,23 @@ async function handle(request: Request, context: Context): Promise<Response> {
   }
   if (project.status === "archived" && method !== "GET")
     throw new AppError("请先恢复项目再继续工作", 409, "PROJECT_ARCHIVED");
+  if (p[2] === "workflow") {
+    const scope = { projectId: project.id, sessionId };
+    if (method === "GET" && p.length === 3) return Response.json(store.workflow.view(scope));
+    if (method === "PATCH" && p[3] === "approval") {
+      store.assertActiveSession(project.id, sessionId);
+      const { policy } = z.strictObject({ policy: z.enum(["ask", "never"]) }).parse(await bodyJson(request));
+      await store.workflow.setApprovalPolicy(scope, policy);
+      return Response.json({ policy });
+    }
+    if (p[3] === "interactions" && p[4] && method === "POST") {
+      store.assertActiveSession(project.id, sessionId);
+      const id = z.string().uuid().parse(p[4]);
+      if (p[5] === "hold") await store.workflow.holdQuestion(scope, id);
+      else await store.workflow.decide(scope, id, interactionDecision.parse(await bodyJson(request)));
+      return Response.json({ ok: true });
+    }
+  }
   if (p[2] === "skills" && store.skills) {
     const library = store.skills;
     const cwd = store.sessionCwd(project.id, sessionId);
@@ -419,6 +437,52 @@ async function handle(request: Request, context: Context): Promise<Response> {
     if (!parsed.success) throw new AppError("消息或素材引用无效，请检查后重试", 400, "CHAT_INPUT_INVALID");
     const input = parsed.data;
     for (const id of parseSessionReferences(input.text, sessionId).references.keys()) store.assertSession(project.id, id);
+    const selected = workflowCommand(input.text);
+    if (selected) {
+      store.assertActiveSession(project.id, sessionId);
+      const scope = { projectId: project.id, sessionId };
+      const result = await store.workflow.runCommand(scope, input.requestId, async () => {
+        if (selected.name === "plan") {
+          const active = selected.input !== "off";
+          if (!active && input.attachmentIds.length)
+            throw new AppError("/plan off 无需附件", 400, "PLAN_INPUT");
+          if (active && (selected.input || input.attachmentIds.length)) {
+            const settings = await store.getSettings(userId, encryptionSecret);
+            if (!settings.textApiKey) throw new AppError("请先在设置中连接大模型", 409, "MODEL_NOT_CONFIGURED");
+            await store.acceptChatAtStep(project.id, { ...input, text: selected.input }, sessionId);
+          }
+          await store.workflow.setPlan(scope, active);
+          return active ? "计划模式已选中" : "计划模式已关闭或将在下一步关闭";
+        }
+        const goal = store.workflow.goal(scope);
+        if (!selected.input) return goal
+          ? goal.objective + " · " + goal.roundsStarted + "/" + goal.maxGoalRounds + " 轮"
+          : "当前对话没有目标";
+        const control = ["pause", "resume", "clear"].includes(selected.input)
+          ? selected.input as "pause" | "resume" | "clear" : undefined;
+        const edit = selected.input === "edit" || selected.input.startsWith("edit ");
+        if (control || edit) {
+          if (!goal) throw new AppError("当前对话没有目标", 409, "GOAL_NOT_FOUND");
+          if (control && input.attachmentIds.length) throw new AppError("此目标命令无需附件", 400, "GOAL_INPUT");
+          const objective = edit ? goalObjective.parse(selected.input.slice(4).trim()) : undefined;
+          await store.workflow.updateGoal(scope, { action: control ?? "edit", goal_id: goal.id, revision: goal.revision,
+            ...(objective ? { objective } : {}) });
+          if (control === "pause" || control === "clear") {
+            const id = store.workflow.activeGoalRun(scope, goal.id);
+            if (id) await controlRun(store, await store.run(id, project.id), "cancel", await store.getSettings(userId, encryptionSecret));
+          }
+        } else {
+          const settings = await store.getSettings(userId, encryptionSecret);
+          if (!settings.textApiKey) throw new AppError("请先在设置中连接大模型", 409, "MODEL_NOT_CONFIGURED");
+          await store.workflow.createGoal(scope, selected.input);
+        }
+        if (input.attachmentIds.length) await store.acceptChatAtStep(project.id,
+          { ...input, text: "这些附件供当前目标参考。" }, sessionId);
+        return control === "pause" ? "目标已暂停" : control === "resume" ? "目标续轮已启用"
+          : control === "clear" ? "目标已清除" : edit ? "目标已更新" : "目标已创建";
+      });
+      return Response.json({ requestId: input.requestId, notice: result });
+    }
     const command = /^\/compact(?:\s|$)/.test(input.text);
     if (command && (input.text !== "/compact" || input.attachmentIds.length))
       throw new AppError("/compact 直接发送即可，无需参数或素材", 400, "COMPACTION_INPUT");

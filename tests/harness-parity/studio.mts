@@ -163,4 +163,6 @@ for (const scenario of cases) result.scenarios[scenario.name] = await run(scenar
 Object.assign(result.scenarios, await studioRecoveryScenarios());
 const { studioExtensions } = await import("./extensions-studio.mts");
 Object.assign(result.scenarios, await studioExtensions());
+const { studioWorkflowScenarios } = await import("./workflows-studio.mts");
+Object.assign(result.scenarios, await studioWorkflowScenarios());
 process.stdout.write(JSON.stringify(result));

@@ -1,3 +1,4 @@
+import { goalObjective, goalRoundLimit, todoList } from "./workflow-types";
 import { recordModelRequest } from "./model-request-record";
 import { createHash } from "node:crypto";
 import { imageSize } from "image-size";
@@ -71,12 +72,18 @@ export function projectArchive(store: Store, projectId: string, bucket: BlobStor
       .bind(projectId).rows();
     const sessions = store.sessions(projectId).map((session) => ({ ...session, cwd: store.sessionCwd(projectId, session.id),
       seed: store.sessionSeed(projectId, session.id)?.messages }));
+    const workflowEvents = store.db.prepare(`SELECT session_id,owner,kind,value,run_id,created_at,event_seq
+      FROM studio_workflow_events WHERE project_id=? AND kind IN ('goal/change','goal/round','todo/write','plan/mode','approval/policy')
+      ORDER BY seq`).bind(projectId).rows();
     const timeline = store.db.prepare(`WITH boundaries AS (${runBoundaries})
       SELECT e.id AS seq,e.type,e.data,e.created_at,a.origin_event_id AS origin,a.root_run_id AS origin_run
       FROM events e LEFT JOIN fork_event_ancestry a ON a.event_id=e.id
       WHERE e.project_id=? AND (${committedRunEvent}) AND (e.type='message' OR json_type(e.data,'$.runId')='text')
-      UNION ALL SELECT seq,type,data,created_at,NULL,NULL FROM boundaries WHERE seq IS NOT NULL ORDER BY seq,type`)
-      .bind(projectId, projectId).rows();
+      UNION ALL SELECT seq,type,data,created_at,NULL,NULL FROM boundaries WHERE seq IS NOT NULL
+      UNION ALL SELECT event_seq,'workflow/record',json_object('sessionId',session_id),created_at,NULL,NULL
+        FROM studio_workflow_events WHERE project_id=? AND kind IN ('goal/change','goal/round','todo/write','plan/mode','approval/policy')
+          AND event_seq IS NOT NULL
+      ORDER BY seq,type`).bind(projectId, projectId, projectId).rows();
     const checkpoints = store.db.prepare(`SELECT j.run_id,j.revision,j.event_seq,j.patch FROM agent_session_events j JOIN runs r ON j.run_id=r.id
       WHERE r.project_id=? AND r.background=0 AND r.agent_role<>'media'
       UNION ALL SELECT j.run_id,j.revision,j.event_seq,j.patch FROM archived_fork_checkpoints j JOIN runs r ON j.run_id=r.id
@@ -84,7 +91,7 @@ export function projectArchive(store: Store, projectId: string, bucket: BlobStor
       .bind(projectId, projectId).rows<{ run_id: string; revision: number; event_seq: number | null; patch: string }>();
     const [project] = store.db.prepare("SELECT title,brief,style,ratio,duration FROM projects WHERE id=?").bind(projectId).rows();
     return { project, files, versions, messages, tasks, jobOutput, replies, requestParts, steps, deliveries, sessions, timeline, checkpoints,
-      references, referenceLines,
+      references, referenceLines, workflowEvents,
       team: sessions.map(({ id, teamEnabled }) => ({ session: id, enabled: teamEnabled, tasks: store.teamTasks(projectId, id, true)
         .map((task) => task.ownerId === leadAgentId ? { ...task, ownerId: null, ownerIsLead: true } : task) })) };
   });
@@ -140,7 +147,8 @@ export function projectArchive(store: Store, projectId: string, bucket: BlobStor
   const archiveMessage = ({ images, source, ...message }: AgentMessage) => ({
     ...message,
     ...(source?.kind === "runtime-context" || source?.kind === "compaction" || source?.kind === "session-reference" ||
-      source?.kind === "schedule-change" || source?.kind === "model-recovery" ||
+      source?.kind === "schedule-change" || source?.kind === "model-recovery" || source?.kind === "goal-round" ||
+      source?.kind === "answer_to_pending_question" ||
       source?.kind === "skill-catalog" || source?.kind === "skill-invocation" ? { source } : {}),
     ...(images?.length ? { images: images.map(archiveImage) } : {}),
   });
@@ -220,6 +228,8 @@ const forkMessage = z.object({
     z.object({ type: z.literal("tool_use"), callIndex: z.number().int().nonnegative().safe() }),
   ])) }).optional(),
   source: z.union([z.object({ kind: z.literal("compaction") }),
+    z.object({ kind: z.literal("goal-round"), goalId: identifier, revision: version, round: version }),
+    z.object({ kind: z.literal("answer_to_pending_question"), tool: z.literal("ask_user_question"), callId: label }),
     z.object({ kind: z.literal("model-recovery") }),
     z.object({ kind: z.literal("schedule-change"), id: label }),
     z.object({ kind: z.literal("session-reference"), snapshotIds: z.array(identifier).optional() }),
@@ -232,6 +242,15 @@ const forkMessage = z.object({
 const requestPartId = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const checkpoint = z.object({ run_id: identifier, revision: version, event_seq: version.nullable(),
   messages: z.object({ start: z.number().int().nonnegative().safe(), remove: z.number().int().nonnegative().safe(), insert: z.array(forkMessage) }).optional() });
+const workflowData = {
+  "goal/change": z.object({ id: identifier, revision: version, objective: goalObjective, phase: z.enum(["active", "paused", "blocked", "complete"]),
+    roundsStarted: z.number().int().nonnegative().safe(), maxGoalRounds: goalRoundLimit, createdAt: time, updatedAt: time,
+    blockedReason: z.object({ code: label, message: goalObjective }).optional() }).nullable(),
+  "goal/round": z.object({ goalId: identifier, revision: version, round: version }),
+  "todo/write": todoList,
+  "plan/mode": z.object({ active: z.boolean(), entered: z.boolean() }),
+  "approval/policy": z.enum(["ask", "never"]),
+};
 const manifest = z.object({
   formatVersion: z.literal(1), project: z.object({ title: z.string().min(1).max(100), brief: z.string().max(12000),
     style: z.string().max(2000), ratio: z.enum(["16:9", "9:16"]), duration: z.number().int().positive() }),
@@ -241,6 +260,10 @@ const manifest = z.object({
     cwd: label.optional(), seed: z.array(forkMessage).optional(), archived: z.boolean().optional(), pinned: z.boolean().optional(),
     position: z.number().int().nonnegative().safe().optional() })).max(3000),
   checkpoints: z.array(checkpoint).max(150000).optional(),
+  workflowEvents: z.array(z.object({ session_id: z.string(), owner: z.union([z.literal("lead"), identifier]),
+    kind: z.enum(["goal/change", "goal/round", "todo/write", "plan/mode", "approval/policy"]),
+    value: z.string().max(250000), run_id: identifier.nullable(), created_at: time, event_seq: version.nullable(),
+  })).max(50000).optional(),
   references: z.array(z.object({ id: identifier, target_session_id: z.string(), input_id: label, source_session_id: z.string(),
     preview: z.string(), total_lines: z.number().int().positive().safe() })).max(30000).optional(),
   tasks: z.array(z.object({ id: identifier, session_id: z.string(), parent_run_id: identifier.nullable(), agent_role: label,
@@ -583,6 +606,11 @@ export async function restoreProjectArchive(store: Store, userId: string, buffer
   for (const row of archive.timeline) {
     const raw = JSON.parse(row.data);
     const id = messages.get(raw.id), runId = tasks.get(raw.runId), requestId = replies.get(raw.requestId);
+    if (row.type === "workflow/record" && row.seq && typeof raw.sessionId === "string") {
+      save.push(db.prepare("INSERT INTO events(project_id,type,data,created_at) VALUES(?,?,?,?)")
+        .bind(projectId, row.type, JSON.stringify({ sessionId: session(raw.sessionId), archiveSeq: row.seq }), row.created_at));
+      continue;
+    }
     if ((row.type === "step" || row.type === "tool/dispatched") && runId && typeof raw.callId === "string") {
       save.push(db.prepare(`INSERT INTO events(project_id,type,data,created_at)
         SELECT ?,?,json_object('runId',run_id,'callId',call_id,'stepSeq',seq,'requestId',request_id,'callIndex',call_index,
@@ -605,6 +633,17 @@ export async function restoreProjectArchive(store: Store, userId: string, buffer
       .bind(projectId, row.type, JSON.stringify({ ...data, archiveSeq: row.seq }), row.created_at));
   }
   const archivedEvent = "(SELECT id FROM events WHERE project_id=? AND json_extract(data,'$.archiveSeq')=? LIMIT 1)";
+  for (const row of archive.workflowEvents ?? []) {
+    const owner = row.owner === "lead" ? "lead" : tasks.get(row.owner);
+    const run = row.run_id === null ? null : tasks.get(row.run_id);
+    if (!owner || row.run_id && !run) throw invalid();
+    const value = JSON.stringify(workflowData[row.kind].parse(JSON.parse(row.value)));
+    save.push(db.prepare(`INSERT INTO studio_workflow_events(project_id,session_id,owner,kind,value,run_id,generation,created_at)
+      VALUES(?,?,?,?,?,?,(SELECT generation FROM runs WHERE id=?),?)`)
+      .bind(projectId, session(row.session_id), owner, row.kind, value, run, run, row.created_at),
+    db.prepare(`UPDATE studio_workflow_events SET event_seq=COALESCE(${archivedEvent},event_seq)
+      WHERE seq=last_insert_rowid()`).bind(projectId, row.event_seq));
+  }
   for (const [run, entries] of checkpointRuns) {
     for (const { entry, seq } of entries) save.push(db.prepare(`INSERT INTO archived_fork_checkpoints(run_id,revision,event_seq,patch)
       VALUES(?,?,${archivedEvent},?)`).bind(tasks.get(run), entry.revision, projectId, seq, JSON.stringify(entry.patch)));

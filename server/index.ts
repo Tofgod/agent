@@ -42,6 +42,11 @@ const skills = new SkillLibrary(path.join(dataDir, "skills"), (env.STUDIO_SKILL_
   bundled: env.DSH_BUNDLED_SKILL_DIR,
 });
 const runtimeOptions = {
+  goalMaxRounds: env.STUDIO_GOAL_MAX_ROUNDS ? Number(env.STUDIO_GOAL_MAX_ROUNDS) : undefined,
+  goalBlockedAfterRounds: env.STUDIO_GOAL_BLOCKED_AFTER_ROUNDS ? Number(env.STUDIO_GOAL_BLOCKED_AFTER_ROUNDS) : undefined,
+  questionTimeout: env.STUDIO_QUESTION_TIMEOUT_SECONDS ? Number(env.STUDIO_QUESTION_TIMEOUT_SECONDS) : undefined,
+  parallelTodos: env.STUDIO_PARALLEL_TODOS !== "false",
+  defaultApprovalPolicy: env.STUDIO_APPROVAL_POLICY === "never" ? "never" as const : "ask" as const,
   mcp, skills, presetPlugins, scheduleToolsEnabled: true, resolveModel: resolveLiveDeepSeekModel,
   schedulePolicy: { newSessionIntervalSeconds: env.STUDIO_NEW_SESSION_INTERVAL_SECONDS ? Number(env.STUDIO_NEW_SESSION_INTERVAL_SECONDS) : undefined,
     historyDays: env.STUDIO_SCHEDULE_HISTORY_DAYS ? Number(env.STUDIO_SCHEDULE_HISTORY_DAYS) : undefined,
@@ -60,6 +65,7 @@ database.initialize(path.resolve("drizzle"));
 await presetPlugins.start("local", installed.host);
 mcp.start("local");
 database.releaseAbandonedLeases({ interruptAgentTurns: true });
+await recovery.workflow.recoverInterruption();
 await recovery.recoverStoppedExecutions();
 await recovery.resumeInterruptedAgentRuns();
 const media = new LocalMediaStore(path.join(dataDir, "media"), database);
